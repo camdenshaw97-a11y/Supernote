@@ -11,6 +11,7 @@ The plugin sends circled handwriting here. The relay asks Claude to clean it up,
 | `GET /health` | No | Confirms the service is awake |
 | `GET /status` | Yes | Shows which keys are configured |
 | `POST /capture` | Yes | Handwriting in, task out |
+| `GET /meeting/upcoming` | Yes | Calendar events for the next day and a half |
 
 The plugin sends the secret in the `x-relay-secret` header.
 
@@ -22,6 +23,8 @@ The plugin sends the secret in the `x-relay-secret` header.
 | `ANTHROPIC_API_KEY` | Recommended | Claude API key. Without it the tablet's own reading is used unchanged |
 | `CLICKUP_TOKEN` | Yes | ClickUp personal API token (starts with `pk_`) |
 | `CLICKUP_LIST_ID` | Yes | List that captured tasks go into |
+| `CALENDAR_ICS_URL` | For the Meeting button | The calendar's "Secret address in iCal format" from Google Calendar settings |
+| `MY_EMAIL` | No | Your calendar email. Hides you from attendee lists and skips meetings you declined |
 | `TIMEZONE` | No | Default `America/Los_Angeles` |
 | `CLAUDE_MODEL` | No | Default `claude-sonnet-5-5` |
 | `DRY_RUN` | No | `1` = do everything except create the task |
@@ -30,7 +33,7 @@ Never put keys in this repo. Set them in the host's environment settings.
 
 ## Run
 
-Needs Node 20 or newer. No packages to install.
+Needs Node 22 or newer. Run `npm install` once.
 
 ```
 node server.js

@@ -17,17 +17,29 @@
  *   CLICKUP_LIST_ID    required for ClickUp captures
  *   TIMEZONE           optional  default America/Los_Angeles
  *   DRY_RUN            optional  "1" = do everything except create the task
+ *   CALENDAR_ICS_URL   required for the Meeting button: the calendar's
+ *                      "Secret address in iCal format" from Google Calendar
+ *   MY_EMAIL           optional  hides you from attendee lists and skips
+ *                      meetings you declined
+ *   FAKE_NOW           optional  only for testing: pretend it is this time
  *   PORT               set by the host
  */
 
 const http = require('http');
 const crypto = require('crypto');
+const ical = require('node-ical');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 25000;
 const CLICKUP_TIMEOUT_MS = 15000;
+const CALENDAR_TIMEOUT_MS = 15000;
+const CALENDAR_CACHE_MS = 60 * 1000;
+const MEETING_LOOKAHEAD_MS = 36 * 60 * 60 * 1000;
+const MEETING_GRACE_MS = 10 * 60 * 1000;
+const MAX_MEETINGS = 8;
+const MAX_ATTENDEES = 8;
 
 function env(name, fallback = '') {
   const value = process.env[name];
@@ -316,6 +328,200 @@ async function handleCapture(body) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Meetings (calendar)
+// ---------------------------------------------------------------------------
+
+let calendarCache = {at: 0, url: '', data: null};
+
+function currentTime() {
+  const fake = env('FAKE_NOW');
+  const parsed = fake ? new Date(fake) : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date();
+}
+
+async function loadCalendar() {
+  const url = env('CALENDAR_ICS_URL');
+  if (!url) {
+    throw Object.assign(new Error('CALENDAR_ICS_URL is not set on the relay'), {status: 500});
+  }
+  const age = Date.now() - calendarCache.at;
+  if (calendarCache.data && calendarCache.url === url && age < CALENDAR_CACHE_MS) {
+    return calendarCache.data;
+  }
+  const res = await fetchWithTimeout(url, {method: 'GET'}, CALENDAR_TIMEOUT_MS);
+  if (!res.ok) {
+    throw Object.assign(new Error(`Calendar answered with HTTP ${res.status}`), {status: 502});
+  }
+  const text = await res.text();
+  if (!text.includes('BEGIN:VCALENDAR')) {
+    throw Object.assign(new Error('The calendar address did not return a calendar'), {status: 502});
+  }
+  const data = ical.sync.parseICS(text);
+  calendarCache = {at: Date.now(), url, data};
+  return data;
+}
+
+function tzParts(date) {
+  const tz = env('TIMEZONE', 'America/Los_Angeles');
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    weekday: 'short',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).formatToParts(date);
+  const get = type => (parts.find(p => p.type === type) || {}).value || '';
+  const isoDay = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+  return {
+    weekday: get('weekday'),
+    month: get('month'),
+    day: get('day'),
+    hour: get('hour'),
+    minute: get('minute'),
+    meridiem: get('dayPeriod').toUpperCase(),
+    isoDay,
+  };
+}
+
+/** "10:00-10:30 AM" or "11:30 AM-12:15 PM". Plain hyphen so any font shows it. */
+function timeRangeLabel(start, end) {
+  const a = tzParts(start);
+  const b = tzParts(end);
+  const from = `${a.hour}:${a.minute}`;
+  const to = `${b.hour}:${b.minute} ${b.meridiem}`;
+  return a.meridiem === b.meridiem ? `${from}-${to}` : `${from} ${a.meridiem}-${to}`;
+}
+
+function dayLabel(date) {
+  const p = tzParts(date);
+  return `${p.weekday}, ${p.month} ${p.day}`;
+}
+
+function plainText(value) {
+  if (value == null) {
+    return '';
+  }
+  if (typeof value === 'object') {
+    return String(value.val == null ? '' : value.val);
+  }
+  return String(value);
+}
+
+function attendeeList(event) {
+  const raw = event.attendee;
+  if (!raw) {
+    return [];
+  }
+  return (Array.isArray(raw) ? raw : [raw]).map(entry => {
+    const params = (entry && entry.params) || {};
+    const email = plainText(entry).replace(/^mailto:/i, '').trim().toLowerCase();
+    let name = String(params.CN || '').trim();
+    if (!name || name.includes('@')) {
+      name = (name || email).split('@')[0];
+    }
+    return {
+      name,
+      email,
+      status: String(params.PARTSTAT || '').toUpperCase(),
+      isResource: String(params.CUTYPE || '').toUpperCase() === 'RESOURCE',
+    };
+  });
+}
+
+/** A name that is safe to use as a file name on the tablet. */
+function safeFileName(text) {
+  const clean = String(text)
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[ .]+|[ .]+$/g, '');
+  return clean.slice(0, 60).trim() || 'Meeting';
+}
+
+async function upcomingMeetings() {
+  const data = await loadCalendar();
+  const now = currentTime();
+  const from = new Date(now.getTime() - MEETING_GRACE_MS);
+  const to = new Date(now.getTime() + MEETING_LOOKAHEAD_MS);
+  const myEmail = env('MY_EMAIL').toLowerCase();
+  const found = [];
+
+  for (const event of Object.values(data)) {
+    if (!event || event.type !== 'VEVENT') {
+      continue;
+    }
+    let instances;
+    try {
+      instances = ical.expandRecurringEvent(event, {from, to, expandOngoing: true});
+    } catch (e) {
+      console.warn('Skipping an event that could not be expanded:', e.message);
+      continue;
+    }
+    for (const instance of instances) {
+      const source = instance.event || event;
+      if (instance.isFullDay) {
+        continue;
+      }
+      if (String(source.status || '').toUpperCase() === 'CANCELLED') {
+        continue;
+      }
+      const start = new Date(instance.start);
+      const end = new Date(instance.end || instance.start);
+      if (end.getTime() <= from.getTime() || start.getTime() > to.getTime()) {
+        continue;
+      }
+      const people = attendeeList(source);
+      if (myEmail && people.some(p => p.email === myEmail && p.status === 'DECLINED')) {
+        continue;
+      }
+      const names = people
+        .filter(p => !p.isResource && p.status !== 'DECLINED' && (!myEmail || p.email !== myEmail))
+        .map(p => p.name);
+      const shown = names.slice(0, MAX_ATTENDEES);
+      if (names.length > shown.length) {
+        shown.push(`+${names.length - shown.length} more`);
+      }
+
+      const title = plainText(instance.summary || source.summary).trim() || '(No title)';
+      const day = dayLabel(start);
+      const time = timeRangeLabel(start, end);
+      const header = [title, `${day}, ${time}`];
+      if (shown.length > 0) {
+        header.push(`With: ${shown.join(', ')}`);
+      }
+      found.push({
+        id: `${plainText(source.uid)}|${start.toISOString()}`,
+        title,
+        start: start.toISOString(),
+        end: end.toISOString(),
+        day,
+        time,
+        isNow: start.getTime() <= now.getTime() && now.getTime() < end.getTime(),
+        startsInMinutes: Math.round((start.getTime() - now.getTime()) / 60000),
+        attendees: shown,
+        fileName: safeFileName(`${tzParts(start).isoDay} ${title}`),
+        header,
+      });
+    }
+  }
+
+  found.sort((a, b) => a.start.localeCompare(b.start) || a.title.localeCompare(b.title));
+  return {
+    ok: true,
+    now: now.toISOString(),
+    today: dayLabel(now),
+    events: found.slice(0, MAX_MEETINGS),
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
@@ -334,9 +540,14 @@ const server = http.createServer(async (req, res) => {
         version: VERSION,
         claude: Boolean(env('ANTHROPIC_API_KEY')),
         clickup: Boolean(env('CLICKUP_TOKEN') && env('CLICKUP_LIST_ID')),
+        calendar: Boolean(env('CALENDAR_ICS_URL')),
         dryRun: env('DRY_RUN') === '1',
         today: todayInTimezone(),
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/meeting/upcoming') {
+      return sendJson(res, 200, await upcomingMeetings());
     }
 
     if (req.method === 'POST' && url.pathname === '/capture') {
