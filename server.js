@@ -17,10 +17,16 @@
  *   CLICKUP_LIST_ID    required for ClickUp captures
  *   TIMEZONE           optional  default America/Los_Angeles
  *   DRY_RUN            optional  "1" = do everything except create the task
- *   CALENDAR_ICS_URL   required for the Meeting button: the calendar's
- *                      "Secret address in iCal format" from Google Calendar
- *   MY_EMAIL           optional  hides you from attendee lists and skips
- *                      meetings you declined
+ *
+ *   Calendar for the Meeting button, one of two routes:
+ *   (a) Google sign-in (works when Workspace hides the secret address)
+ *       GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET   from a Google Cloud OAuth client
+ *       GOOGLE_REFRESH_TOKEN                     shown once after visiting /oauth/start
+ *       GOOGLE_CALENDAR_ID                       optional, default "primary"
+ *   (b) CALENDAR_ICS_URL  the calendar's "Secret address in iCal format"
+ *       MY_EMAIL          optional with (b): hides you from attendee lists and
+ *                         skips meetings you declined
+ *
  *   FAKE_NOW           optional  only for testing: pretend it is this time
  *   PORT               set by the host
  */
@@ -29,7 +35,7 @@ const http = require('http');
 const crypto = require('crypto');
 const ical = require('node-ical');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 25000;
@@ -40,10 +46,37 @@ const MEETING_LOOKAHEAD_MS = 36 * 60 * 60 * 1000;
 const MEETING_GRACE_MS = 10 * 60 * 1000;
 const MAX_MEETINGS = 8;
 const MAX_ATTENDEES = 8;
+const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/calendar.events.readonly';
+const OAUTH_STATE_MS = 10 * 60 * 1000;
 
 function env(name, fallback = '') {
   const value = process.env[name];
   return value == null || value === '' ? fallback : value;
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function sendPage(res, status, title, bodyHtml) {
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>${escapeHtml(title)}</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;color:#111}
+textarea{width:100%;height:110px;font:13px/1.4 ui-monospace,monospace;padding:10px;box-sizing:border-box}
+code{background:#eee;padding:2px 5px;border-radius:4px}</style></head>
+<body><h1>${escapeHtml(title)}</h1>${bodyHtml}</body></html>`;
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(html),
+  });
+  res.end(html);
 }
 
 function sendJson(res, status, body) {
@@ -446,14 +479,11 @@ function safeFileName(text) {
   return clean.slice(0, 60).trim() || 'Meeting';
 }
 
-async function upcomingMeetings() {
+/** Events from the secret iCal address, in the relay's common shape. */
+async function icsEvents(from, to) {
   const data = await loadCalendar();
-  const now = currentTime();
-  const from = new Date(now.getTime() - MEETING_GRACE_MS);
-  const to = new Date(now.getTime() + MEETING_LOOKAHEAD_MS);
   const myEmail = env('MY_EMAIL').toLowerCase();
-  const found = [];
-
+  const out = [];
   for (const event of Object.values(data)) {
     if (!event || event.type !== 'VEVENT') {
       continue;
@@ -467,59 +497,279 @@ async function upcomingMeetings() {
     }
     for (const instance of instances) {
       const source = instance.event || event;
-      if (instance.isFullDay) {
+      if (instance.isFullDay || String(source.status || '').toUpperCase() === 'CANCELLED') {
         continue;
       }
-      if (String(source.status || '').toUpperCase() === 'CANCELLED') {
-        continue;
-      }
-      const start = new Date(instance.start);
-      const end = new Date(instance.end || instance.start);
-      if (end.getTime() <= from.getTime() || start.getTime() > to.getTime()) {
-        continue;
-      }
-      const people = attendeeList(source);
-      if (myEmail && people.some(p => p.email === myEmail && p.status === 'DECLINED')) {
-        continue;
-      }
-      const names = people
-        .filter(p => !p.isResource && p.status !== 'DECLINED' && (!myEmail || p.email !== myEmail))
-        .map(p => p.name);
-      const shown = names.slice(0, MAX_ATTENDEES);
-      if (names.length > shown.length) {
-        shown.push(`+${names.length - shown.length} more`);
-      }
-
-      const title = plainText(instance.summary || source.summary).trim() || '(No title)';
-      const day = dayLabel(start);
-      const time = timeRangeLabel(start, end);
-      const header = [title, `${day}, ${time}`];
-      if (shown.length > 0) {
-        header.push(`With: ${shown.join(', ')}`);
-      }
-      found.push({
-        id: `${plainText(source.uid)}|${start.toISOString()}`,
-        title,
-        start: start.toISOString(),
-        end: end.toISOString(),
-        day,
-        time,
-        isNow: start.getTime() <= now.getTime() && now.getTime() < end.getTime(),
-        startsInMinutes: Math.round((start.getTime() - now.getTime()) / 60000),
-        attendees: shown,
-        fileName: safeFileName(`${tzParts(start).isoDay} ${title}`),
-        header,
+      out.push({
+        uid: plainText(source.uid),
+        title: plainText(instance.summary || source.summary),
+        start: new Date(instance.start),
+        end: new Date(instance.end || instance.start),
+        people: attendeeList(source).map(p => ({
+          ...p,
+          isSelf: Boolean(myEmail) && p.email === myEmail,
+        })),
       });
     }
+  }
+  return out;
+}
+
+// --- Google sign-in route ---------------------------------------------------
+
+let googleToken = {value: '', expiresAt: 0};
+const oauthStates = new Map();
+
+function googleClientReady() {
+  return Boolean(env('GOOGLE_CLIENT_ID') && env('GOOGLE_CLIENT_SECRET'));
+}
+
+function publicBaseUrl(req) {
+  const fixed = env('PUBLIC_URL') || env('RENDER_EXTERNAL_URL');
+  return (fixed || `https://${req.headers.host}`).replace(/\/+$/, '');
+}
+
+async function googleTokenRequest(fields) {
+  const res = await fetchWithTimeout(
+    env('GOOGLE_TOKEN_URL', 'https://oauth2.googleapis.com/token'),
+    {
+      method: 'POST',
+      headers: {'content-type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({
+        client_id: env('GOOGLE_CLIENT_ID'),
+        client_secret: env('GOOGLE_CLIENT_SECRET'),
+        ...fields,
+      }).toString(),
+    },
+    CALENDAR_TIMEOUT_MS,
+  );
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = null;
+  }
+  return {ok: res.ok, status: res.status, data: data || {}};
+}
+
+async function googleAccessToken() {
+  if (googleToken.value && Date.now() < googleToken.expiresAt - 60000) {
+    return googleToken.value;
+  }
+  const {ok, status, data} = await googleTokenRequest({
+    refresh_token: env('GOOGLE_REFRESH_TOKEN'),
+    grant_type: 'refresh_token',
+  });
+  if (!ok || !data.access_token) {
+    const reason = data.error_description || data.error || `HTTP ${status}`;
+    throw Object.assign(
+      new Error(`Google would not renew the calendar connection (${reason}). Reconnect at /oauth/start.`),
+      {status: 502},
+    );
+  }
+  googleToken = {
+    value: data.access_token,
+    expiresAt: Date.now() + (Number(data.expires_in) || 3000) * 1000,
+  };
+  return googleToken.value;
+}
+
+/** Events from the Google Calendar API, in the relay's common shape. */
+async function googleEvents(from, to) {
+  const token = await googleAccessToken();
+  const base = env('GOOGLE_API_BASE', 'https://www.googleapis.com/calendar/v3');
+  const calendarId = encodeURIComponent(env('GOOGLE_CALENDAR_ID', 'primary'));
+  const params = new URLSearchParams({
+    singleEvents: 'true',
+    orderBy: 'startTime',
+    timeMin: from.toISOString(),
+    timeMax: to.toISOString(),
+    maxResults: '50',
+  });
+  const res = await fetchWithTimeout(
+    `${base}/calendars/${calendarId}/events?${params}`,
+    {method: 'GET', headers: {Authorization: `Bearer ${token}`}},
+    CALENDAR_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    if (res.status === 401) {
+      googleToken = {value: '', expiresAt: 0};
+    }
+    throw Object.assign(new Error(`Google Calendar ${res.status}: ${text.slice(0, 200)}`), {status: 502});
+  }
+  const data = await res.json();
+  const out = [];
+  for (const item of data.items || []) {
+    if (!item || item.status === 'cancelled') {
+      continue;
+    }
+    // All-day entries have start.date instead of start.dateTime.
+    if (!item.start || !item.start.dateTime || !item.end || !item.end.dateTime) {
+      continue;
+    }
+    // Working location, out of office, focus time and birthdays are not meetings.
+    if (item.eventType && item.eventType !== 'default') {
+      continue;
+    }
+    out.push({
+      uid: String(item.id || ''),
+      title: String(item.summary || ''),
+      start: new Date(item.start.dateTime),
+      end: new Date(item.end.dateTime),
+      people: (item.attendees || []).map(a => {
+        const email = String(a.email || '').toLowerCase();
+        let name = String(a.displayName || '').trim();
+        if (!name || name.includes('@')) {
+          name = (name || email).split('@')[0];
+        }
+        return {
+          name,
+          email,
+          status: String(a.responseStatus || '').toUpperCase(),
+          isResource: Boolean(a.resource),
+          isSelf: Boolean(a.self),
+        };
+      }),
+    });
+  }
+  return out;
+}
+
+function calendarSource() {
+  if (googleClientReady() && env('GOOGLE_REFRESH_TOKEN')) {
+    return 'google';
+  }
+  if (env('CALENDAR_ICS_URL')) {
+    return 'ics';
+  }
+  return null;
+}
+
+async function upcomingMeetings() {
+  const source = calendarSource();
+  if (!source) {
+    throw Object.assign(new Error('No calendar is connected to the relay yet'), {status: 500});
+  }
+  const now = currentTime();
+  const from = new Date(now.getTime() - MEETING_GRACE_MS);
+  const to = new Date(now.getTime() + MEETING_LOOKAHEAD_MS);
+  const raw = source === 'google' ? await googleEvents(from, to) : await icsEvents(from, to);
+  const found = [];
+
+  for (const item of raw) {
+    const {start, end} = item;
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      continue;
+    }
+    if (end.getTime() <= from.getTime() || start.getTime() > to.getTime()) {
+      continue;
+    }
+    if (item.people.some(p => p.isSelf && p.status === 'DECLINED')) {
+      continue;
+    }
+    const names = item.people
+      .filter(p => !p.isResource && !p.isSelf && p.status !== 'DECLINED')
+      .map(p => p.name);
+    const shown = names.slice(0, MAX_ATTENDEES);
+    if (names.length > shown.length) {
+      shown.push(`+${names.length - shown.length} more`);
+    }
+
+    const title = String(item.title || '').trim() || '(No title)';
+    const day = dayLabel(start);
+    const time = timeRangeLabel(start, end);
+    const header = [title, `${day}, ${time}`];
+    if (shown.length > 0) {
+      header.push(`With: ${shown.join(', ')}`);
+    }
+    found.push({
+      id: `${item.uid}|${start.toISOString()}`,
+      title,
+      start: start.toISOString(),
+      end: end.toISOString(),
+      day,
+      time,
+      isNow: start.getTime() <= now.getTime() && now.getTime() < end.getTime(),
+      startsInMinutes: Math.round((start.getTime() - now.getTime()) / 60000),
+      attendees: shown,
+      fileName: safeFileName(`${tzParts(start).isoDay} ${title}`),
+      header,
+    });
   }
 
   found.sort((a, b) => a.start.localeCompare(b.start) || a.title.localeCompare(b.title));
   return {
     ok: true,
+    source,
     now: now.toISOString(),
     today: dayLabel(now),
     events: found.slice(0, MAX_MEETINGS),
   };
+}
+
+/** Step 1 of connecting Google Calendar: send the browser to Google. */
+function handleOauthStart(req, res) {
+  if (!googleClientReady()) {
+    return sendPage(res, 500, 'Not ready yet',
+      '<p>Add <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code> to the relay settings first, then open this page again.</p>');
+  }
+  if (env('GOOGLE_REFRESH_TOKEN')) {
+    return sendPage(res, 409, 'Already connected',
+      '<p>A calendar is already connected. To connect again, remove <code>GOOGLE_REFRESH_TOKEN</code> from the relay settings first.</p>');
+  }
+  const now = Date.now();
+  for (const [key, expires] of oauthStates) {
+    if (expires < now) {
+      oauthStates.delete(key);
+    }
+  }
+  const state = crypto.randomBytes(24).toString('hex');
+  oauthStates.set(state, now + OAUTH_STATE_MS);
+  const params = new URLSearchParams({
+    client_id: env('GOOGLE_CLIENT_ID'),
+    redirect_uri: `${publicBaseUrl(req)}/oauth/callback`,
+    response_type: 'code',
+    scope: GOOGLE_SCOPE,
+    access_type: 'offline',
+    prompt: 'consent',
+    state,
+  });
+  res.writeHead(302, {Location: `${env('GOOGLE_AUTH_URL', GOOGLE_AUTH_URL)}?${params}`, 'Cache-Control': 'no-store'});
+  res.end();
+}
+
+/** Step 2: Google sends the browser back here with a one-time code. */
+async function handleOauthCallback(req, res, url) {
+  const state = url.searchParams.get('state') || '';
+  const expires = oauthStates.get(state);
+  oauthStates.delete(state);
+  if (!expires || expires < Date.now()) {
+    return sendPage(res, 400, 'That link expired',
+      '<p>Start again at <code>/oauth/start</code>.</p>');
+  }
+  if (url.searchParams.get('error')) {
+    return sendPage(res, 400, 'Google did not connect',
+      `<p>Google said: <code>${escapeHtml(url.searchParams.get('error'))}</code>. Start again at <code>/oauth/start</code>.</p>`);
+  }
+  const code = url.searchParams.get('code') || '';
+  const {ok, status, data} = await googleTokenRequest({
+    code,
+    grant_type: 'authorization_code',
+    redirect_uri: `${publicBaseUrl(req)}/oauth/callback`,
+  });
+  if (!ok) {
+    const reason = data.error_description || data.error || `HTTP ${status}`;
+    return sendPage(res, 502, 'Google did not connect', `<p>Google said: <code>${escapeHtml(reason)}</code>.</p>`);
+  }
+  if (!data.refresh_token) {
+    return sendPage(res, 502, 'Almost',
+      '<p>Google signed you in but did not hand over a long-lived key. Remove this app under your Google Account → Security → Third-party connections, then start again at <code>/oauth/start</code>.</p>');
+  }
+  return sendPage(res, 200, 'Calendar connected: one step left',
+    `<p>Copy everything in this box and add it to the relay settings on Render as <code>GOOGLE_REFRESH_TOKEN</code>, then save and deploy.</p>
+<textarea readonly onclick="this.select()">${escapeHtml(data.refresh_token)}</textarea>
+<p>Treat it like a password. It gives read-only access to your calendar events. This page will not show it again.</p>`);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -528,6 +778,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
       // Open on purpose: lets the host and the plugin check the service is awake.
       return sendJson(res, 200, {ok: true, service: 'nomad-bridge-relay', version: VERSION});
+    }
+
+    // Browser pages for connecting Google Calendar. No relay secret: a browser
+    // cannot send one, and each run only ever shows the signed-in person their
+    // own key.
+    if (req.method === 'GET' && url.pathname === '/oauth/start') {
+      return handleOauthStart(req, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/oauth/callback') {
+      return await handleOauthCallback(req, res, url);
     }
 
     if (!secretMatches(req.headers['x-relay-secret'])) {
@@ -540,7 +800,8 @@ const server = http.createServer(async (req, res) => {
         version: VERSION,
         claude: Boolean(env('ANTHROPIC_API_KEY')),
         clickup: Boolean(env('CLICKUP_TOKEN') && env('CLICKUP_LIST_ID')),
-        calendar: Boolean(env('CALENDAR_ICS_URL')),
+        calendar: calendarSource() || false,
+        googleClient: googleClientReady(),
         dryRun: env('DRY_RUN') === '1',
         today: todayInTimezone(),
       });

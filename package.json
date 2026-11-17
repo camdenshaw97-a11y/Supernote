@@ -1,6 +1,6 @@
 {
   "name": "nomad-bridge-relay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Relay between the Nomad Bridge Supernote plugin and Claude, ClickUp, Linear, Slack and Google Calendar.",
   "main": "server.js",
