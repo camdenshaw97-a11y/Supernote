@@ -35,7 +35,7 @@ const http = require('http');
 const crypto = require('crypto');
 const ical = require('node-ical');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 25000;
@@ -772,6 +772,27 @@ async function handleOauthCallback(req, res, url) {
 <p>Treat it like a password. It gives read-only access to your calendar events. This page will not show it again.</p>`);
 }
 
+// Plain pages Google asks for before a sign-in app can be used long term.
+const ABOUT_HTML = `
+<p>Nomad Bridge is a private tool that connects one person's Supernote e-ink tablet to the work apps they already use. It is not a public product and is not offered to anyone else.</p>
+<p>What it does:</p>
+<ul>
+<li>Turns handwriting circled on the tablet into a task in the owner's to-do list.</li>
+<li>Lists the owner's upcoming calendar meetings on the tablet so a note can be started for one of them.</li>
+</ul>
+<p><a href="/privacy">Privacy policy</a></p>`;
+
+const PRIVACY_HTML = `
+<p>Nomad Bridge is a private, single-user tool. This page describes what it does with data.</p>
+<h2>Google Calendar</h2>
+<p>When its owner signs in with Google, Nomad Bridge receives read-only access to that account's calendar events. It reads the title, start and end time, and attendee names of events in the next day and a half, only when the owner asks for them from the tablet. It uses them to show a list of upcoming meetings and to name a new note. It cannot create, change or delete events.</p>
+<p>Calendar details are not saved to a database, not used for advertising, not sold, and not shared with anyone. They are sent only to the owner's own tablet.</p>
+<h2>Handwriting captures</h2>
+<p>Handwriting the owner chooses to send is passed to Anthropic's Claude API to be read and tidied, then to ClickUp to create a task in the owner's own list. Nomad Bridge does not keep a copy.</p>
+<h2>Access and removal</h2>
+<p>Requests to this service require a private key held on the owner's tablet. Google access can be removed at any time from the Google Account page under Security, Third-party connections.</p>
+<p><a href="/about">About Nomad Bridge</a></p>`;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
@@ -783,6 +804,12 @@ const server = http.createServer(async (req, res) => {
     // Browser pages for connecting Google Calendar. No relay secret: a browser
     // cannot send one, and each run only ever shows the signed-in person their
     // own key.
+    if (req.method === 'GET' && url.pathname === '/about') {
+      return sendPage(res, 200, 'Nomad Bridge', ABOUT_HTML);
+    }
+    if (req.method === 'GET' && url.pathname === '/privacy') {
+      return sendPage(res, 200, 'Nomad Bridge privacy policy', PRIVACY_HTML);
+    }
     if (req.method === 'GET' && url.pathname === '/oauth/start') {
       return handleOauthStart(req, res);
     }
