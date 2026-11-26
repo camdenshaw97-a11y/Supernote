@@ -32,6 +32,9 @@
  *   by a scheduled Claude task into a ClickUp list and shown by the plugin.
  *       CLICKUP_BRIEF_LIST_ID   the list that holds the briefs; uses CLICKUP_TOKEN
  *
+ *   SHOW_ALL_EVENTS    optional  set to 1 to list every timed calendar entry.
+ *                                By default only entries with another attendee
+ *                                or a video-call link are listed (Google route).
  *   FAKE_NOW           optional  only for testing: pretend it is this time
  *   CLICKUP_API_BASE   optional  only for testing against a stand-in server
  *   PORT               set by the host
@@ -41,7 +44,7 @@
 const http = require('http');
 const crypto = require('crypto');
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 25000;
@@ -594,6 +597,24 @@ async function googleAccessToken() {
 }
 
 /** Events from the Google Calendar API, in the relay's common shape. */
+const CALL_LINK = /(zoom\.us|meet\.google\.com|teams\.microsoft\.com|teams\.live\.com|webex\.com|gotomeeting\.com|whereby\.com|calendly\.com)/i;
+
+/** A meeting has someone else on it, or a video-call link. */
+function looksLikeMeeting(item) {
+  const others = (item.attendees || []).filter(a => a && !a.self && !a.resource);
+  if (others.length > 0) {
+    return true;
+  }
+  if (item.hangoutLink) {
+    return true;
+  }
+  const entryPoints = (item.conferenceData && item.conferenceData.entryPoints) || [];
+  if (entryPoints.length > 0) {
+    return true;
+  }
+  return CALL_LINK.test(`${item.location || ''} ${item.description || ''}`);
+}
+
 async function googleEvents(from, to) {
   const token = await googleAccessToken();
   const base = env('GOOGLE_API_BASE', 'https://www.googleapis.com/calendar/v3');
@@ -629,6 +650,11 @@ async function googleEvents(from, to) {
     }
     // Working location, out of office, focus time and birthdays are not meetings.
     if (item.eventType && item.eventType !== 'default') {
+      continue;
+    }
+    // Personal reminders and routines sit on the same calendar. Unless
+    // SHOW_ALL_EVENTS=1, keep only entries that look like a meeting.
+    if (env('SHOW_ALL_EVENTS') !== '1' && !looksLikeMeeting(item)) {
       continue;
     }
     out.push({
