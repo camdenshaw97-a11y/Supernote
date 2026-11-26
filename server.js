@@ -6,7 +6,8 @@
  * The Supernote plugin sends handwriting here. This service asks Claude to
  * clean it up, files it in the right app, and tells the plugin what it did.
  *
- * No dependencies: Node 20+ only.
+ * Needs Node 22 or newer. One package, node-ical, loaded only when the iCal
+ * calendar route is used.
  *
  * Environment variables:
  *   RELAY_SECRET       required  shared secret the plugin sends in x-relay-secret
@@ -27,15 +28,20 @@
  *       MY_EMAIL          optional with (b): hides you from attendee lists and
  *                         skips meetings you declined
  *
+ *   Meeting briefs (optional): short context lines for each meeting, written
+ *   by a scheduled Claude task into a ClickUp list and shown by the plugin.
+ *       CLICKUP_BRIEF_LIST_ID   the list that holds the briefs; uses CLICKUP_TOKEN
+ *
  *   FAKE_NOW           optional  only for testing: pretend it is this time
+ *   CLICKUP_API_BASE   optional  only for testing against a stand-in server
  *   PORT               set by the host
+ *   HOST               optional  address to listen on (e.g. 127.0.0.1); default all
  */
 
 const http = require('http');
 const crypto = require('crypto');
-const ical = require('node-ical');
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CLAUDE_TIMEOUT_MS = 25000;
@@ -46,6 +52,10 @@ const MEETING_LOOKAHEAD_MS = 36 * 60 * 60 * 1000;
 const MEETING_GRACE_MS = 10 * 60 * 1000;
 const MAX_MEETINGS = 8;
 const MAX_ATTENDEES = 8;
+const BRIEF_TIMEOUT_MS = 6000;
+const BRIEF_CACHE_MS = 60 * 1000;
+const MAX_BRIEF_LINES = 8;
+const MAX_BRIEF_LINE_CHARS = 160;
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/calendar.events.readonly';
 const OAUTH_STATE_MS = 10 * 60 * 1000;
@@ -373,6 +383,15 @@ function currentTime() {
   return parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date();
 }
 
+/** node-ical is only needed for the iCal route, so it is loaded on first use. */
+let icalModule = null;
+function icalLib() {
+  if (!icalModule) {
+    icalModule = require('node-ical');
+  }
+  return icalModule;
+}
+
 async function loadCalendar() {
   const url = env('CALENDAR_ICS_URL');
   if (!url) {
@@ -390,7 +409,7 @@ async function loadCalendar() {
   if (!text.includes('BEGIN:VCALENDAR')) {
     throw Object.assign(new Error('The calendar address did not return a calendar'), {status: 502});
   }
-  const data = ical.sync.parseICS(text);
+  const data = icalLib().sync.parseICS(text);
   calendarCache = {at: Date.now(), url, data};
   return data;
 }
@@ -490,7 +509,7 @@ async function icsEvents(from, to) {
     }
     let instances;
     try {
-      instances = ical.expandRecurringEvent(event, {from, to, expandOngoing: true});
+      instances = icalLib().expandRecurringEvent(event, {from, to, expandOngoing: true});
     } catch (e) {
       console.warn('Skipping an event that could not be expanded:', e.message);
       continue;
@@ -636,6 +655,119 @@ async function googleEvents(from, to) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Meeting briefs
+//
+// A scheduled Claude task writes one ClickUp task per upcoming meeting into the
+// list CLICKUP_BRIEF_LIST_ID. The task text holds two key lines and then the
+// brief, one short line per row:
+//
+//   event=<calendar event id>
+//   start=<ISO start time>
+//   <brief line>
+//   <brief line>
+//
+// Briefs are a nice-to-have: any failure here is logged and the meeting list is
+// returned without them.
+// ---------------------------------------------------------------------------
+
+let briefCache = {at: 0, listId: '', data: []};
+
+function briefsEnabled() {
+  return Boolean(env('CLICKUP_TOKEN') && env('CLICKUP_BRIEF_LIST_ID'));
+}
+
+function normalizeTitle(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/** Turns one ClickUp task into {eventId, startMs, title, lines}, or null. */
+function parseBrief(task) {
+  const sources = [task.text_content, task.description, task.markdown_description];
+  for (const source of sources) {
+    const text = String(source || '').replace(/\\([_*~`#>\[\]()=+.!-])/g, '$1');
+    if (!text.trim()) {
+      continue;
+    }
+    let eventId = '';
+    let startMs = NaN;
+    const lines = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+      // Bullets, numbering and code marks may be added by the editor; drop them.
+      const line = rawLine.replace(/`/g, '').trim().replace(/^(?:[-*•>]+|\d+[.)])\s+/, '').trim();
+      if (!line || /^[-_*=]{3,}$/.test(line)) {
+        continue;
+      }
+      const key = /^(event|start)\s*[=:]\s*(\S+)\s*$/i.exec(line);
+      if (key && key[1].toLowerCase() === 'event') {
+        eventId = key[2];
+        continue;
+      }
+      if (key && key[1].toLowerCase() === 'start') {
+        startMs = new Date(key[2]).getTime();
+        continue;
+      }
+      if (lines.length < MAX_BRIEF_LINES) {
+        lines.push(line.slice(0, MAX_BRIEF_LINE_CHARS));
+      }
+    }
+    if ((eventId || !Number.isNaN(startMs)) && lines.length > 0) {
+      return {eventId, startMs, title: normalizeTitle(task.name), lines};
+    }
+  }
+  return null;
+}
+
+async function loadBriefs() {
+  if (!briefsEnabled()) {
+    return [];
+  }
+  const listId = env('CLICKUP_BRIEF_LIST_ID');
+  const age = Date.now() - briefCache.at;
+  if (briefCache.listId === listId && age < BRIEF_CACHE_MS) {
+    return briefCache.data;
+  }
+  const base = env('CLICKUP_API_BASE', 'https://api.clickup.com/api/v2');
+  const params = new URLSearchParams({
+    archived: 'false',
+    include_closed: 'false',
+    subtasks: 'false',
+    include_markdown_description: 'true',
+  });
+  const res = await fetchWithTimeout(
+    `${base}/list/${encodeURIComponent(listId)}/task?${params}`,
+    {method: 'GET', headers: {Authorization: env('CLICKUP_TOKEN')}},
+    BRIEF_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    throw new Error(`ClickUp ${res.status} while reading briefs`);
+  }
+  const data = await res.json();
+  const briefs = [];
+  for (const task of Array.isArray(data.tasks) ? data.tasks : []) {
+    const brief = parseBrief(task || {});
+    if (brief) {
+      briefs.push(brief);
+    }
+  }
+  briefCache = {at: Date.now(), listId, data: briefs};
+  return briefs;
+}
+
+/** The brief for one meeting: matched by event id, else by start time and title. */
+function briefFor(briefs, {uid, start, title}) {
+  const byId = briefs.find(b => b.eventId && b.eventId === uid);
+  if (byId) {
+    return byId.lines;
+  }
+  const startMs = start.getTime();
+  const wanted = normalizeTitle(title);
+  const byTime = briefs.find(
+    b => Math.abs(b.startMs - startMs) < 60000 && (!b.title || !wanted || b.title.includes(wanted) || wanted.includes(b.title)),
+  );
+  return byTime ? byTime.lines : [];
+}
+
 function calendarSource() {
   if (googleClientReady() && env('GOOGLE_REFRESH_TOKEN')) {
     return 'google';
@@ -655,6 +787,12 @@ async function upcomingMeetings() {
   const from = new Date(now.getTime() - MEETING_GRACE_MS);
   const to = new Date(now.getTime() + MEETING_LOOKAHEAD_MS);
   const raw = source === 'google' ? await googleEvents(from, to) : await icsEvents(from, to);
+  let briefs = [];
+  try {
+    briefs = await loadBriefs();
+  } catch (e) {
+    console.error('Meeting briefs skipped:', e.message);
+  }
   const found = [];
 
   for (const item of raw) {
@@ -695,6 +833,7 @@ async function upcomingMeetings() {
       attendees: shown,
       fileName: safeFileName(`${tzParts(start).isoDay} ${title}`),
       header,
+      brief: briefFor(briefs, {uid: item.uid, start, title}),
     });
   }
 
@@ -828,6 +967,7 @@ const server = http.createServer(async (req, res) => {
         claude: Boolean(env('ANTHROPIC_API_KEY')),
         clickup: Boolean(env('CLICKUP_TOKEN') && env('CLICKUP_LIST_ID')),
         calendar: calendarSource() || false,
+        briefs: briefsEnabled(),
         googleClient: googleClientReady(),
         dryRun: env('DRY_RUN') === '1',
         today: todayInTimezone(),
@@ -856,6 +996,7 @@ if (!env('RELAY_SECRET')) {
   console.warn('RELAY_SECRET is not set: every request except /health will be rejected.');
 }
 
-server.listen(PORT, () => {
-  console.log(`nomad-bridge-relay ${VERSION} listening on ${PORT}`);
+const HOST = env('HOST');
+server.listen(PORT, HOST || undefined, () => {
+  console.log(`nomad-bridge-relay ${VERSION} listening on ${HOST || 'all addresses'}:${PORT}`);
 });

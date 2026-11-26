@@ -28,6 +28,8 @@ The plugin sends the secret in the `x-relay-secret` header.
 | `GOOGLE_REFRESH_TOKEN` | For the Meeting button | Shown once after signing in at `/oauth/start` |
 | `CALENDAR_ICS_URL` | Alternative to the three above | The calendar's "Secret address in iCal format", if your Google account shows one |
 | `MY_EMAIL` | No | Only with `CALENDAR_ICS_URL`: hides you from attendee lists and skips meetings you declined |
+| `CLICKUP_BRIEF_LIST_ID` | No | ClickUp list holding meeting briefs (written by a scheduled Claude task). When set, each meeting in `/meeting/upcoming` carries a `brief` array |
+| `HOST` | No | Address to listen on, e.g. `127.0.0.1`. Default: all addresses |
 | `TIMEZONE` | No | Default `America/Los_Angeles` |
 | `CLAUDE_MODEL` | No | Default `claude-sonnet-5-5` |
 | `DRY_RUN` | No | `1` = do everything except create the task |
