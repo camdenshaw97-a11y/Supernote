@@ -12,9 +12,19 @@ The plugin sends circled handwriting here. The relay asks Claude to clean it up,
 | `GET /status` | Yes | Shows which keys are configured |
 | `POST /capture` | Yes | Handwriting in, task out |
 | `GET /meeting/upcoming` | Yes | Calendar events for the next day and a half |
+| `POST /meeting/end` | Yes | Pictures of the meeting's pages in; summary out, and the note-taker's own action items filed as tasks |
+| `POST /mcp` | Own token | Read-only connector so Claude can search and read the notes archive (only when the archive is on) |
 | `GET /oauth/start` | No (browser page) | One-time: connect Google Calendar by signing in |
 
 The plugin sends the secret in the `x-relay-secret` header.
+
+### Meeting → End
+
+The plugin sends up to 8 page pictures and, when it knows it, the meeting they belong to. If it does not, the relay uses the calendar meeting that is running or ended most recently. Claude copies out the handwriting, writes a short summary and separates the note-taker's action items from other people's. Only the note-taker's become tasks. A `requestId` makes a repeated request safe: the same id never files twice.
+
+### Notes archive and connector
+
+With `NOTES_DIR` set, every capture and every ended meeting is saved there (`records/*.json`, `pages/*.png`). With `NOTES_MCP_TOKEN` also set, `/mcp` serves a small read-only Model Context Protocol connector with four tools: `search_notes`, `list_recent_notes`, `read_note` and `get_note_page_image`. Add it in Claude as a custom connector with the header `Authorization: Bearer <token>`. It cannot file, change or delete anything.
 
 ## Settings (environment variables)
 
@@ -30,6 +40,9 @@ The plugin sends the secret in the `x-relay-secret` header.
 | `MY_EMAIL` | No | Only with `CALENDAR_ICS_URL`: hides you from attendee lists and skips meetings you declined |
 | `CLICKUP_BRIEF_LIST_ID` | No | ClickUp list holding meeting briefs (written by a scheduled Claude task). When set, each meeting in `/meeting/upcoming` carries a `brief` array |
 | `SHOW_ALL_EVENTS` | No | Set to `1` to list every timed calendar entry. By default only entries with another attendee or a video-call link are listed |
+| `NOTES_DIR` | No | Folder for the notes archive. Unset = nothing is kept |
+| `NOTES_MCP_TOKEN` | No | Long random string. Turns on the `/mcp` connector (needs `NOTES_DIR`) |
+| `OWNER_NAME` | No | The note-taker's first name, so their action items can be told apart from other people's |
 | `HOST` | No | Address to listen on, e.g. `127.0.0.1`. Default: all addresses |
 | `TIMEZONE` | No | Default `America/Los_Angeles` |
 | `CLAUDE_MODEL` | No | Default `claude-sonnet-5-5` |

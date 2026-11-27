@@ -32,6 +32,15 @@
  *   by a scheduled Claude task into a ClickUp list and shown by the plugin.
  *       CLICKUP_BRIEF_LIST_ID   the list that holds the briefs; uses CLICKUP_TOKEN
  *
+ *   Notes archive (optional): keeps a copy of what the tablet sends so it can
+ *   be searched later. Off unless NOTES_DIR is set.
+ *       NOTES_DIR         a folder this service may write to
+ *       NOTES_MCP_TOKEN   turns on the read-only connector at /mcp, which lets
+ *                         Claude search and read the archive. Sent by the
+ *                         connector as "Authorization: Bearer <token>".
+ *       OWNER_NAME        optional  the note-taker's first name, so "my tasks"
+ *                         can be told apart from other people's in a meeting
+ *
  *   SHOW_ALL_EVENTS    optional  set to 1 to list every timed calendar entry.
  *                                By default only entries with another attendee
  *                                or a video-call link are listed (Google route).
@@ -43,10 +52,21 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+// Meeting pages arrive as pictures, several at a time.
+const MAX_MEETING_BODY_BYTES = 24 * 1024 * 1024;
+const MAX_END_PAGES = 8;
+const MAX_END_TASKS = 10;
+// The public address cuts a request off at 100 s, so Claude gets less than that.
+const MEETING_END_TIMEOUT_MS = 75000;
+const MEETING_RECENT_MS = 4 * 60 * 60 * 1000;
+const MAX_SUMMARY_LINES = 8;
+const MAX_SUMMARY_LINE_CHARS = 140;
 const CLAUDE_TIMEOUT_MS = 25000;
 const CLICKUP_TIMEOUT_MS = 15000;
 const CALENDAR_TIMEOUT_MS = 15000;
@@ -112,13 +132,13 @@ function secretMatches(given) {
   return crypto.timingSafeEqual(a, b);
 }
 
-function readJsonBody(req) {
+function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', chunk => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         reject(Object.assign(new Error('Request too large'), {status: 413}));
         req.destroy();
         return;
@@ -298,7 +318,7 @@ async function createClickUpTask({task, rawText, notePath, page}) {
   }
 
   const res = await fetchWithTimeout(
-    `https://api.clickup.com/api/v2/list/${encodeURIComponent(listId)}/task`,
+    `${env('CLICKUP_API_BASE', 'https://api.clickup.com/api/v2')}/list/${encodeURIComponent(listId)}/task`,
     {
       method: 'POST',
       headers: {'content-type': 'application/json', Authorization: token},
@@ -359,6 +379,21 @@ async function handleCapture(body) {
     notePath: body.notePath,
     page: body.page,
   });
+
+  // Keep a searchable copy. Never lets a capture fail.
+  if (!created.dryRun) {
+    archiveNote(
+      {
+        kind: 'capture',
+        title: task.title,
+        notePath: typeof body.notePath === 'string' ? body.notePath : '',
+        text: [task.title, task.details].filter(Boolean).join('\n'),
+        tabletReading: rawText.trim(),
+        tasks: [{title: task.title, dueDate: task.dueDate, id: created.id, url: created.url}],
+      },
+      [{page: Number.isInteger(body.page) ? body.page : null, imageBase64, text: ''}],
+    );
+  }
 
   return {
     ok: true,
@@ -937,6 +972,810 @@ async function handleOauthCallback(req, res, url) {
 <p>Treat it like a password. It gives read-only access to your calendar events. This page will not show it again.</p>`);
 }
 
+// ---------------------------------------------------------------------------
+// Notes archive
+//
+// When NOTES_DIR is set, every capture and every ended meeting is kept there:
+//   records/<id>.json   what was written, the summary, the tasks created
+//   pages/<id>-pN.png   the picture of each page or selection
+// Nothing here is needed for a capture or a meeting to succeed, so every
+// failure is logged and swallowed.
+// ---------------------------------------------------------------------------
+
+function notesDir() {
+  return env('NOTES_DIR');
+}
+
+let notesCache = null;
+
+function newNoteId(kind, at) {
+  const stamp = at.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  return `${stamp}-${kind === 'meeting' ? 'm' : 'c'}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+function notebookName(notePath) {
+  return String(notePath || '').split('/').pop().replace(/\.note$/i, '');
+}
+
+/**
+ * Saves one note. `record` holds the fields of the note; `pages` is a list of
+ * {page, imageBase64, text}. Returns the id, or null if nothing was saved.
+ */
+function archiveNote(record, pages) {
+  const dir = notesDir();
+  if (!dir) {
+    return null;
+  }
+  try {
+    const at = new Date();
+    const id = record.id || newNoteId(record.kind, at);
+    fs.mkdirSync(path.join(dir, 'records'), {recursive: true});
+    fs.mkdirSync(path.join(dir, 'pages'), {recursive: true});
+    const savedPages = [];
+    (pages || []).forEach((page, index) => {
+      let image = null;
+      if (page.imageBase64) {
+        image = `${id}-p${index + 1}.png`;
+        fs.writeFileSync(path.join(dir, 'pages', image), Buffer.from(page.imageBase64, 'base64'));
+      }
+      savedPages.push({
+        page: Number.isInteger(page.page) ? page.page : null,
+        image,
+        text: String(page.text || ''),
+      });
+    });
+    const full = {
+      id,
+      kind: record.kind,
+      at: at.toISOString(),
+      day: tzParts(at).isoDay,
+      title: String(record.title || '').trim() || '(untitled)',
+      notebook: notebookName(record.notePath),
+      notePath: String(record.notePath || ''),
+      meeting: record.meeting || null,
+      customer: String(record.customer || ''),
+      summary: Array.isArray(record.summary) ? record.summary : [],
+      tasks: Array.isArray(record.tasks) ? record.tasks : [],
+      others: Array.isArray(record.others) ? record.others : [],
+      text: String(record.text || ''),
+      tabletReading: String(record.tabletReading || ''),
+      pages: savedPages,
+      relayVersion: VERSION,
+    };
+    const target = path.join(dir, 'records', `${id}.json`);
+    fs.writeFileSync(`${target}.tmp`, JSON.stringify(full, null, 1));
+    fs.renameSync(`${target}.tmp`, target);
+    notesCache = null;
+    return id;
+  } catch (e) {
+    console.error('Notes archive: could not save a note:', e.message);
+    return null;
+  }
+}
+
+/** Every archived note, newest first. Read once and kept until the next save. */
+function loadNotes() {
+  const dir = notesDir();
+  if (!dir) {
+    return [];
+  }
+  if (notesCache) {
+    return notesCache;
+  }
+  const out = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(path.join(dir, 'records'));
+  } catch (e) {
+    names = [];
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) {
+      continue;
+    }
+    try {
+      const note = JSON.parse(fs.readFileSync(path.join(dir, 'records', name), 'utf8'));
+      if (note && note.id) {
+        out.push(note);
+      }
+    } catch (e) {
+      console.error(`Notes archive: skipping ${name}:`, e.message);
+    }
+  }
+  out.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  notesCache = out;
+  return out;
+}
+
+/** All the words of a note in one lower-case string, for searching. */
+function noteHaystack(note) {
+  const meeting = note.meeting || {};
+  return [
+    note.title,
+    note.notebook,
+    note.customer,
+    meeting.title,
+    (meeting.attendees || []).join(' '),
+    (note.summary || []).join(' '),
+    (note.tasks || []).map(t => t.title).join(' '),
+    (note.others || []).join(' '),
+    note.text,
+    note.tabletReading,
+    (note.pages || []).map(p => p.text).join(' '),
+  ]
+    .join(' ')
+    .toLowerCase();
+}
+
+function noteMatchesFilters(note, {kind, since, until}) {
+  if (kind && note.kind !== kind) {
+    return false;
+  }
+  if (since && String(note.day) < since) {
+    return false;
+  }
+  if (until && String(note.day) > until) {
+    return false;
+  }
+  return true;
+}
+
+function noteLine(note) {
+  const kind = note.kind === 'meeting' ? 'Meeting' : 'Capture';
+  const where = note.notebook ? ` | notebook: ${note.notebook}` : '';
+  const pages = (note.pages || []).length;
+  return `${note.id} | ${note.day} | ${kind} | ${note.title}${where} | ${pages} page${pages === 1 ? '' : 's'}`;
+}
+
+function noteSnippet(note, terms) {
+  const body = [
+    (note.summary || []).join(' '),
+    note.text,
+    (note.pages || []).map(p => p.text).join(' '),
+    note.tabletReading,
+  ]
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const lower = body.toLowerCase();
+  let at = -1;
+  for (const term of terms) {
+    at = lower.indexOf(term);
+    if (at !== -1) {
+      break;
+    }
+  }
+  const start = Math.max(0, at === -1 ? 0 : at - 80);
+  const piece = body.slice(start, start + 240);
+  return `${start > 0 ? '…' : ''}${piece}${start + 240 < body.length ? '…' : ''}`;
+}
+
+function noteFullText(note) {
+  const lines = [];
+  lines.push(`${note.kind === 'meeting' ? 'Meeting notes' : 'Capture'}: ${note.title}`);
+  lines.push(`Id: ${note.id}`);
+  lines.push(`Saved: ${note.day} (${note.at})`);
+  if (note.notebook) {
+    lines.push(`Notebook: ${note.notebook}`);
+  }
+  if (note.meeting) {
+    const m = note.meeting;
+    lines.push(`Meeting: ${m.title || ''}${m.day ? `, ${m.day}` : ''}${m.time ? `, ${m.time}` : ''}`);
+    if ((m.attendees || []).length > 0) {
+      lines.push(`With: ${m.attendees.join(', ')}`);
+    }
+  }
+  if (note.customer) {
+    lines.push(`Customer: ${note.customer}`);
+  }
+  if ((note.summary || []).length > 0) {
+    lines.push('', 'Summary:');
+    note.summary.forEach(line => lines.push(`- ${line}`));
+  }
+  if ((note.tasks || []).length > 0) {
+    lines.push('', 'Tasks filed in ClickUp:');
+    note.tasks.forEach(t => {
+      lines.push(`- ${t.title}${t.dueDate ? ` (due ${t.dueDate})` : ''}${t.url ? ` ${t.url}` : ''}${t.error ? ' [NOT CREATED]' : ''}`);
+    });
+  }
+  if ((note.others || []).length > 0) {
+    lines.push('', 'Action items for other people:');
+    note.others.forEach(line => lines.push(`- ${line}`));
+  }
+  if (note.kind !== 'meeting' && note.text) {
+    lines.push('', 'Text:', note.text);
+  }
+  if (note.tabletReading) {
+    lines.push('', "Tablet's own reading of the handwriting:", note.tabletReading);
+  }
+  (note.pages || []).forEach((page, index) => {
+    if (page.text) {
+      lines.push('', `Page ${index + 1} (as written):`, page.text);
+    }
+  });
+  const withImages = (note.pages || []).filter(p => p.image).length;
+  if (withImages > 0) {
+    lines.push('', `Pictures of the handwriting: ${withImages} (use get_note_page_image with this id and page 1 to ${note.pages.length}).`);
+  }
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Meeting → End
+//
+// The plugin sends pictures of the pages written during a meeting. Claude
+// reads them, writes a short summary and pulls out the note-taker's own action
+// items, which become ClickUp tasks. Other people's action items are listed
+// but never turned into tasks.
+// ---------------------------------------------------------------------------
+
+const finishedMeetings = new Map();
+
+function cleanLines(value, maxLines, maxChars) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map(line => String(line == null ? '' : line).replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, maxLines)
+    .map(line => line.slice(0, maxChars));
+}
+
+/** The meeting the notes belong to, when the tablet did not say: now, or just ended. */
+async function recentMeeting() {
+  const source = calendarSource();
+  if (!source) {
+    return null;
+  }
+  const now = currentTime();
+  const from = new Date(now.getTime() - MEETING_RECENT_MS);
+  const to = new Date(now.getTime() + MEETING_GRACE_MS);
+  const raw = source === 'google' ? await googleEvents(from, to) : await icsEvents(from, to);
+  const usable = raw.filter(
+    item =>
+      !Number.isNaN(item.start.getTime()) &&
+      !Number.isNaN(item.end.getTime()) &&
+      item.start.getTime() <= now.getTime() &&
+      !item.people.some(p => p.isSelf && p.status === 'DECLINED'),
+  );
+  if (usable.length === 0) {
+    return null;
+  }
+  const running = usable.filter(item => item.end.getTime() > now.getTime());
+  const pool = running.length > 0 ? running : usable;
+  // Running: the one that started last. Otherwise: the one that ended last.
+  pool.sort((a, b) =>
+    running.length > 0 ? b.start.getTime() - a.start.getTime() : b.end.getTime() - a.end.getTime(),
+  );
+  const item = pool[0];
+  let brief = [];
+  try {
+    brief = briefFor(await loadBriefs(), {uid: item.uid, start: item.start, title: item.title});
+  } catch (e) {
+    brief = [];
+  }
+  return {
+    title: String(item.title || '').trim() || '(No title)',
+    day: dayLabel(item.start),
+    time: timeRangeLabel(item.start, item.end),
+    attendees: item.people
+      .filter(p => !p.isResource && !p.isSelf && p.status !== 'DECLINED')
+      .map(p => p.name)
+      .slice(0, MAX_ATTENDEES),
+    brief,
+  };
+}
+
+/** Asks Claude to read the pages. Returns {transcript, summary, customer, myTasks, others}. */
+async function summarizeMeeting({meeting, pages}) {
+  const apiKey = env('ANTHROPIC_API_KEY');
+  if (!apiKey) {
+    throw Object.assign(new Error('ANTHROPIC_API_KEY is not set on the relay'), {status: 500});
+  }
+  const today = todayInTimezone();
+  const owner = env('OWNER_NAME');
+
+  const system = [
+    'You read handwritten meeting notes and turn them into a short summary and a task list for the person who wrote them (the note-taker).',
+    'You receive pictures of the note pages in order. A page may start with typed lines (the meeting title, time, attendees and a few context lines prepared beforehand). Typed lines are background, not notes.',
+    owner ? `The note-taker is ${owner}.` : '',
+    `Today is ${today.weekday}, ${today.date} (${today.tz}).`,
+    'Use only what is written. Do not invent decisions, people, dates, numbers or tasks. If the handwriting is empty or unreadable, return empty lists.',
+    'Reply with a single JSON object and nothing else:',
+    '{"transcript": [string], "summary": [string], "customer": string, "my_tasks": [{"title": string, "details": string, "due_date": string|null}], "others": [string]}',
+    '- transcript: one string per page, in order: the handwriting copied out as plain text with its line breaks. Write [?] for a word you cannot read. Leave typed lines out.',
+    '- summary: 3 to 6 short lines, at most 90 characters each, covering decisions, key facts and numbers. Fewer if little was written.',
+    '- customer: the customer or company the meeting is about, or an empty string for an internal meeting.',
+    '- my_tasks: action items the note-taker has to do. An item is the note-taker\'s unless the notes clearly give it to someone else (another name or initials in front of it, "X to ...", an arrow to a name).',
+    '  title: at most 80 characters. When there is a customer, start with the customer name and a colon, then a verb ("Acme Pools: send the onboarding checklist"). Otherwise start with a verb.',
+    '  details: anything written about the task that does not fit in the title, otherwise an empty string.',
+    '  due_date: YYYY-MM-DD if the notes state a date or day for it (resolve a weekday to its next occurrence, today counts), otherwise null.',
+    '- others: action items that belong to someone else, each as "Name: what", at most 90 characters.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const content = [];
+  const context = [];
+  if (meeting) {
+    context.push(`Meeting: ${meeting.title}`);
+    if (meeting.day || meeting.time) {
+      context.push(`When: ${[meeting.day, meeting.time].filter(Boolean).join(', ')}`);
+    }
+    if ((meeting.attendees || []).length > 0) {
+      context.push(`With: ${meeting.attendees.join(', ')}`);
+    }
+    if ((meeting.brief || []).length > 0) {
+      context.push('Background prepared before the meeting (not notes):');
+      meeting.brief.forEach(line => context.push(`- ${line}`));
+    }
+  } else {
+    context.push('The calendar meeting for these notes is not known.');
+  }
+  content.push({type: 'text', text: context.join('\n')});
+  pages.forEach((page, index) => {
+    content.push({type: 'text', text: `Page ${index + 1} of ${pages.length}:`});
+    content.push({
+      type: 'image',
+      source: {type: 'base64', media_type: 'image/png', data: page.imageBase64},
+    });
+  });
+
+  const res = await fetchWithTimeout(
+    `${env('ANTHROPIC_BASE_URL', 'https://api.anthropic.com')}/v1/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: env('CLAUDE_MODEL', 'claude-sonnet-5-5'),
+        max_tokens: 3000,
+        system,
+        messages: [{role: 'user', content}],
+      }),
+    },
+    MEETING_END_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw Object.assign(new Error(`Claude API ${res.status}: ${body.slice(0, 300)}`), {status: 502});
+  }
+  const data = await res.json();
+  const reply = (data.content || [])
+    .filter(part => part.type === 'text')
+    .map(part => part.text)
+    .join('');
+  let parsed;
+  try {
+    parsed = extractJson(reply);
+  } catch (e) {
+    throw Object.assign(new Error('Claude did not return a readable summary'), {status: 502});
+  }
+  const myTasks = [];
+  for (const item of Array.isArray(parsed.my_tasks) ? parsed.my_tasks : []) {
+    const title = String((item && item.title) || '').replace(/\s+/g, ' ').trim();
+    if (!title || myTasks.length >= MAX_END_TASKS) {
+      continue;
+    }
+    myTasks.push({
+      title: title.slice(0, 200),
+      details: String((item && item.details) || '').trim(),
+      dueDate: isIsoDate(item && item.due_date) ? item.due_date : null,
+    });
+  }
+  return {
+    transcript: (Array.isArray(parsed.transcript) ? parsed.transcript : []).map(t => String(t == null ? '' : t)),
+    summary: cleanLines(parsed.summary, MAX_SUMMARY_LINES, MAX_SUMMARY_LINE_CHARS),
+    customer: String(parsed.customer || '').trim().slice(0, 80),
+    myTasks,
+    others: cleanLines(parsed.others, MAX_END_TASKS, MAX_SUMMARY_LINE_CHARS),
+  };
+}
+
+/** Creates one ClickUp task in the to-do list. Returns {id, url, dryRun}. */
+async function clickUpCreate({name, description, dueDate}) {
+  const body = {name, description};
+  if (dueDate) {
+    // Noon UTC keeps the date on the same calendar day across US timezones.
+    const [y, m, d] = dueDate.split('-').map(Number);
+    body.due_date = Date.UTC(y, m - 1, d, 12, 0, 0);
+    body.due_date_time = false;
+  }
+  if (env('DRY_RUN') === '1') {
+    return {id: 'dry-run', url: null, dryRun: true};
+  }
+  const token = env('CLICKUP_TOKEN');
+  const listId = env('CLICKUP_LIST_ID');
+  if (!token || !listId) {
+    throw new Error('CLICKUP_TOKEN or CLICKUP_LIST_ID is not set');
+  }
+  const base = env('CLICKUP_API_BASE', 'https://api.clickup.com/api/v2');
+  const res = await fetchWithTimeout(
+    `${base}/list/${encodeURIComponent(listId)}/task`,
+    {
+      method: 'POST',
+      headers: {'content-type': 'application/json', Authorization: token},
+      body: JSON.stringify(body),
+    },
+    CLICKUP_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`ClickUp ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  return {id: data.id, url: data.url || null, dryRun: false};
+}
+
+async function handleMeetingEnd(body) {
+  const requestId = typeof body.requestId === 'string' ? body.requestId.slice(0, 64) : '';
+  if (requestId && finishedMeetings.has(requestId)) {
+    // The tablet asked again for something already done: never file twice.
+    return {...finishedMeetings.get(requestId), repeat: true};
+  }
+
+  const pages = [];
+  for (const raw of Array.isArray(body.pages) ? body.pages : []) {
+    if (raw && typeof raw.imageBase64 === 'string' && raw.imageBase64) {
+      pages.push({
+        page: Number.isInteger(raw.page) ? raw.page : null,
+        imageBase64: raw.imageBase64,
+      });
+    }
+  }
+  if (pages.length === 0) {
+    throw Object.assign(new Error('No pages were sent'), {status: 400});
+  }
+  if (pages.length > MAX_END_PAGES) {
+    throw Object.assign(new Error(`At most ${MAX_END_PAGES} pages can be summarized at once`), {status: 400});
+  }
+  const notePath = typeof body.notePath === 'string' ? body.notePath : '';
+
+  let meeting = null;
+  const given = body.event && typeof body.event === 'object' ? body.event : null;
+  if (given && String(given.title || '').trim()) {
+    meeting = {
+      title: String(given.title).trim().slice(0, 200),
+      day: String(given.day || '').slice(0, 40),
+      time: String(given.time || '').slice(0, 40),
+      attendees: cleanLines(given.attendees, MAX_ATTENDEES + 1, 80),
+      brief: cleanLines(given.brief, MAX_BRIEF_LINES, MAX_BRIEF_LINE_CHARS),
+    };
+  } else {
+    try {
+      meeting = await recentMeeting();
+    } catch (e) {
+      console.error('Meeting end: calendar lookup skipped:', e.message);
+    }
+  }
+
+  const read = await summarizeMeeting({meeting, pages});
+
+  const notebook = notebookName(notePath);
+  const source = `Captured from Supernote${notebook ? `: ${notebook}` : ''}, ${pages.length} page${pages.length === 1 ? '' : 's'}.`;
+  const meetingLine = meeting
+    ? `From meeting: ${meeting.title}${meeting.day ? ` (${[meeting.day, meeting.time].filter(Boolean).join(', ')})` : ''}`
+    : 'From meeting notes.';
+
+  const tasks = [];
+  let dryRun = false;
+  for (const task of read.myTasks) {
+    const description = [task.details, meetingLine, source].filter(Boolean).join('\n\n');
+    try {
+      const created = await clickUpCreate({name: task.title, description, dueDate: task.dueDate});
+      dryRun = dryRun || created.dryRun;
+      tasks.push({title: task.title, dueDate: task.dueDate, id: created.id, url: created.url});
+    } catch (e) {
+      console.error('Meeting end: a task was not created:', e.message);
+      tasks.push({title: task.title, dueDate: task.dueDate, id: null, url: null, error: e.message});
+    }
+  }
+
+  const title = meeting ? meeting.title : read.customer || 'Meeting notes';
+  let archivedId = null;
+  if (!dryRun) {
+    archivedId = archiveNote(
+      {
+        kind: 'meeting',
+        title,
+        notePath,
+        meeting: meeting
+          ? {title: meeting.title, day: meeting.day, time: meeting.time, attendees: meeting.attendees}
+          : null,
+        customer: read.customer,
+        summary: read.summary,
+        tasks,
+        others: read.others,
+        text: read.transcript.join('\n\n'),
+      },
+      pages.map((page, index) => ({
+        page: page.page,
+        imageBase64: page.imageBase64,
+        text: read.transcript[index] || '',
+      })),
+    );
+  }
+
+  const result = {
+    ok: true,
+    requestId,
+    meeting: meeting ? {title: meeting.title, day: meeting.day, time: meeting.time} : null,
+    title,
+    customer: read.customer,
+    summary: read.summary,
+    tasks,
+    taskErrors: tasks.filter(t => t.error).length,
+    others: read.others,
+    pages: pages.length,
+    archived: Boolean(archivedId),
+    noteId: archivedId,
+    dryRun,
+  };
+  if (requestId) {
+    finishedMeetings.set(requestId, result);
+    if (finishedMeetings.size > 30) {
+      finishedMeetings.delete(finishedMeetings.keys().next().value);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Notes connector (/mcp)
+//
+// A small, read-only Model Context Protocol server so Claude can search and
+// read the notes archive. One JSON answer per request; nothing is kept between
+// requests. It can only read NOTES_DIR: it cannot file, change or delete.
+// ---------------------------------------------------------------------------
+
+const MCP_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const MCP_DEFAULT_VERSION = '2025-06-18';
+const NOTE_ID = /^[0-9A-Za-z-]{8,48}$/;
+
+const MCP_TOOLS = [
+  {
+    name: 'search_notes',
+    title: 'Search Supernote notes',
+    description:
+      "Search the owner's handwritten Supernote notes: meeting notes ended with the Meeting button (summary, action items, the handwriting copied out) and single captures sent to ClickUp. Every word of the query must appear somewhere in the note. Returns matching notes, newest first, with an id for read_note.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {type: 'string', description: 'Words to look for, e.g. a customer name, a person or a topic.'},
+        kind: {type: 'string', enum: ['meeting', 'capture'], description: 'Only this kind of note.'},
+        since: {type: 'string', description: 'Only notes saved on or after this day, YYYY-MM-DD.'},
+        until: {type: 'string', description: 'Only notes saved on or before this day, YYYY-MM-DD.'},
+        limit: {type: 'integer', minimum: 1, maximum: 25, description: 'How many to return (default 10).'},
+      },
+      required: ['query'],
+    },
+    annotations: {readOnlyHint: true, openWorldHint: false},
+  },
+  {
+    name: 'list_recent_notes',
+    title: 'List recent Supernote notes',
+    description:
+      'List the most recent Supernote notes, newest first, without searching. Use it for "what did I write today" or "my last meeting notes".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: {type: 'string', enum: ['meeting', 'capture'], description: 'Only this kind of note.'},
+        since: {type: 'string', description: 'Only notes saved on or after this day, YYYY-MM-DD.'},
+        until: {type: 'string', description: 'Only notes saved on or before this day, YYYY-MM-DD.'},
+        limit: {type: 'integer', minimum: 1, maximum: 25, description: 'How many to return (default 10).'},
+      },
+    },
+    annotations: {readOnlyHint: true, openWorldHint: false},
+  },
+  {
+    name: 'read_note',
+    title: 'Read one Supernote note',
+    description:
+      'Read one note in full by id: the meeting it belongs to, the summary, the tasks filed in ClickUp, action items for other people, and the handwriting copied out page by page.',
+    inputSchema: {
+      type: 'object',
+      properties: {id: {type: 'string', description: 'The note id from search_notes or list_recent_notes.'}},
+      required: ['id'],
+    },
+    annotations: {readOnlyHint: true, openWorldHint: false},
+  },
+  {
+    name: 'get_note_page_image',
+    title: 'See a page of a Supernote note',
+    description:
+      'Get the picture of one handwritten page of a note, to check the handwriting yourself (a drawing, a number that looks misread).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {type: 'string', description: 'The note id.'},
+        page: {type: 'integer', minimum: 1, description: 'Which page of the note, starting at 1.'},
+      },
+      required: ['id', 'page'],
+    },
+    annotations: {readOnlyHint: true, openWorldHint: false},
+  },
+];
+
+function mcpEnabled() {
+  return Boolean(notesDir() && env('NOTES_MCP_TOKEN'));
+}
+
+function mcpTokenMatches(header) {
+  const match = /^Bearer\s+(.+)$/i.exec(typeof header === 'string' ? header.trim() : '');
+  if (!match) {
+    return false;
+  }
+  const a = crypto.createHash('sha256').update(match[1]).digest();
+  const b = crypto.createHash('sha256').update(env('NOTES_MCP_TOKEN')).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function isDay(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function mcpText(text, isError = false) {
+  return {content: [{type: 'text', text}], isError};
+}
+
+function mcpFilters(args) {
+  return {
+    kind: args.kind === 'meeting' || args.kind === 'capture' ? args.kind : '',
+    since: isDay(args.since) ? args.since : '',
+    until: isDay(args.until) ? args.until : '',
+    limit: Math.min(25, Math.max(1, Number.isInteger(args.limit) ? args.limit : 10)),
+  };
+}
+
+function mcpCallTool(name, args) {
+  if (name === 'search_notes') {
+    const terms = String(args.query || '')
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (terms.length === 0) {
+      return mcpText('Give at least one word to search for.', true);
+    }
+    const filters = mcpFilters(args);
+    const hits = loadNotes().filter(note => {
+      if (!noteMatchesFilters(note, filters)) {
+        return false;
+      }
+      const hay = noteHaystack(note);
+      return terms.every(term => hay.includes(term));
+    });
+    if (hits.length === 0) {
+      return mcpText(`No notes match "${terms.join(' ')}". ${loadNotes().length} notes are in the archive.`);
+    }
+    const lines = hits
+      .slice(0, filters.limit)
+      .map(note => `${noteLine(note)}\n    ${noteSnippet(note, terms)}`);
+    return mcpText(
+      `${hits.length} note${hits.length === 1 ? '' : 's'} match${hits.length === 1 ? 'es' : ''}; showing ${Math.min(hits.length, filters.limit)}, newest first.\nid | day | kind | title | notebook | pages\n\n${lines.join('\n')}`,
+    );
+  }
+
+  if (name === 'list_recent_notes') {
+    const filters = mcpFilters(args);
+    const notes = loadNotes().filter(note => noteMatchesFilters(note, filters));
+    if (notes.length === 0) {
+      return mcpText('No notes in the archive for that filter yet.');
+    }
+    return mcpText(
+      `${notes.length} note${notes.length === 1 ? '' : 's'}; showing ${Math.min(notes.length, filters.limit)}, newest first.\nid | day | kind | title | notebook | pages\n\n${notes.slice(0, filters.limit).map(noteLine).join('\n')}`,
+    );
+  }
+
+  if (name === 'read_note' || name === 'get_note_page_image') {
+    const id = String(args.id || '');
+    const note = NOTE_ID.test(id) ? loadNotes().find(n => n.id === id) : null;
+    if (!note) {
+      return mcpText(`No note with id "${id.slice(0, 60)}". Use search_notes or list_recent_notes to find one.`, true);
+    }
+    if (name === 'read_note') {
+      return mcpText(noteFullText(note));
+    }
+    const index = Number.isInteger(args.page) ? args.page : 0;
+    const page = (note.pages || [])[index - 1];
+    if (!page || !page.image || !/^[0-9A-Za-z-]+\.png$/.test(page.image)) {
+      return mcpText(`That note has ${(note.pages || []).length} page(s), and no picture for page ${index}.`, true);
+    }
+    try {
+      const data = fs.readFileSync(path.join(notesDir(), 'pages', page.image)).toString('base64');
+      return {
+        content: [
+          {type: 'text', text: `Page ${index} of "${note.title}" (${note.day}).`},
+          {type: 'image', data, mimeType: 'image/png'},
+        ],
+        isError: false,
+      };
+    } catch (e) {
+      return mcpText('The picture for that page could not be read.', true);
+    }
+  }
+
+  return null;
+}
+
+/** Answers one JSON-RPC message. Returns the reply, or null for a notification. */
+function mcpAnswer(message) {
+  if (!message || typeof message !== 'object' || message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
+    return {jsonrpc: '2.0', id: null, error: {code: -32600, message: 'Invalid request'}};
+  }
+  const hasId = Object.prototype.hasOwnProperty.call(message, 'id') && message.id !== null;
+  if (!hasId) {
+    return null;
+  }
+  const reply = result => ({jsonrpc: '2.0', id: message.id, result});
+  const fail = (code, text) => ({jsonrpc: '2.0', id: message.id, error: {code, message: text}});
+  const params = message.params && typeof message.params === 'object' ? message.params : {};
+
+  switch (message.method) {
+    case 'initialize': {
+      const asked = String(params.protocolVersion || '');
+      return reply({
+        protocolVersion: MCP_VERSIONS.includes(asked) ? asked : MCP_DEFAULT_VERSION,
+        capabilities: {tools: {listChanged: false}},
+        serverInfo: {name: 'supernote-notes', title: 'Supernote notes', version: VERSION},
+        instructions:
+          "Read-only access to the owner's handwritten Supernote notes: meeting notes with summaries and action items, and single captures. Search with search_notes, then read_note for the full text.",
+      });
+    }
+    case 'ping':
+      return reply({});
+    case 'tools/list':
+      return reply({tools: MCP_TOOLS});
+    case 'tools/call': {
+      const args = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};
+      let result;
+      try {
+        result = mcpCallTool(String(params.name || ''), args);
+      } catch (e) {
+        console.error('Notes connector: a tool failed:', e.message);
+        result = mcpText('The notes archive could not be read just now.', true);
+      }
+      return result ? reply(result) : fail(-32602, `Unknown tool: ${String(params.name || '').slice(0, 60)}`);
+    }
+    case 'resources/list':
+      return reply({resources: []});
+    case 'prompts/list':
+      return reply({prompts: []});
+    default:
+      return fail(-32601, `Method not found: ${message.method.slice(0, 60)}`);
+  }
+}
+
+async function handleMcp(req, res) {
+  if (!mcpEnabled()) {
+    return sendJson(res, 404, {ok: false, error: 'Not found'});
+  }
+  if (!mcpTokenMatches(req.headers.authorization)) {
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    return sendJson(res, 401, {ok: false, error: 'Wrong or missing connector token'});
+  }
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return sendJson(res, 405, {ok: false, error: 'This connector answers POST requests only'});
+  }
+  let body;
+  try {
+    body = await readJsonBody(req, 1024 * 1024);
+  } catch (e) {
+    return sendJson(res, 400, {jsonrpc: '2.0', id: null, error: {code: -32700, message: 'Parse error'}});
+  }
+  const batch = Array.isArray(body);
+  const replies = (batch ? body : [body]).map(mcpAnswer).filter(Boolean);
+  if (replies.length === 0) {
+    res.writeHead(202);
+    return res.end();
+  }
+  return sendJson(res, 200, batch ? replies : replies[0]);
+}
+
 // Plain pages Google asks for before a sign-in app can be used long term.
 const ABOUT_HTML = `
 <p>Nomad Bridge is a private tool that connects one person's Supernote e-ink tablet to the work apps they already use. It is not a public product and is not offered to anyone else.</p>
@@ -944,6 +1783,7 @@ const ABOUT_HTML = `
 <ul>
 <li>Turns handwriting circled on the tablet into a task in the owner's to-do list.</li>
 <li>Lists the owner's upcoming calendar meetings on the tablet so a note can be started for one of them.</li>
+<li>Summarizes the owner's handwritten meeting notes and files the owner's own action items as tasks.</li>
 </ul>
 <p><a href="/privacy">Privacy policy</a></p>`;
 
@@ -953,7 +1793,8 @@ const PRIVACY_HTML = `
 <p>When its owner signs in with Google, Nomad Bridge receives read-only access to that account's calendar events. It reads the title, start and end time, and attendee names of events in the next day and a half, only when the owner asks for them from the tablet. It uses them to show a list of upcoming meetings and to name a new note. It cannot create, change or delete events.</p>
 <p>Calendar details are not saved to a database, not used for advertising, not sold, and not shared with anyone. They are sent only to the owner's own tablet.</p>
 <h2>Handwriting captures</h2>
-<p>Handwriting the owner chooses to send is passed to Anthropic's Claude API to be read and tidied, then to ClickUp to create a task in the owner's own list. Nomad Bridge does not keep a copy.</p>
+<p>Handwriting the owner chooses to send is passed to Anthropic's Claude API to be read and tidied, then to ClickUp to create a task in the owner's own list. The same happens to the meeting pages the owner chooses to summarize.</p>
+<p>When the owner has turned on the notes archive, a copy of what was sent is kept on the owner's own server so the owner can search it later. It is readable only with a private key held by the owner and is not shared with anyone. Without the archive, Nomad Bridge does not keep a copy.</p>
 <h2>Access and removal</h2>
 <p>Requests to this service require a private key held on the owner's tablet. Google access can be removed at any time from the Google Account page under Security, Third-party connections.</p>
 <p><a href="/about">About Nomad Bridge</a></p>`;
@@ -982,6 +1823,12 @@ const server = http.createServer(async (req, res) => {
       return await handleOauthCallback(req, res, url);
     }
 
+    // The notes connector has its own key (a Bearer token), separate from the
+    // tablet's secret, and can only read the archive.
+    if (url.pathname === '/mcp') {
+      return await handleMcp(req, res);
+    }
+
     if (!secretMatches(req.headers['x-relay-secret'])) {
       return sendJson(res, 401, {ok: false, error: 'Wrong or missing relay secret'});
     }
@@ -994,6 +1841,9 @@ const server = http.createServer(async (req, res) => {
         clickup: Boolean(env('CLICKUP_TOKEN') && env('CLICKUP_LIST_ID')),
         calendar: calendarSource() || false,
         briefs: briefsEnabled(),
+        meetingEnd: true,
+        notes: Boolean(notesDir()),
+        notesConnector: mcpEnabled(),
         googleClient: googleClientReady(),
         dryRun: env('DRY_RUN') === '1',
         today: todayInTimezone(),
@@ -1008,6 +1858,11 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const result = await handleCapture(body);
       return sendJson(res, 200, result);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/meeting/end') {
+      const body = await readJsonBody(req, MAX_MEETING_BODY_BYTES);
+      return sendJson(res, 200, await handleMeetingEnd(body));
     }
 
     return sendJson(res, 404, {ok: false, error: 'Not found'});
