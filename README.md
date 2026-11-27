@@ -13,6 +13,8 @@ The plugin sends circled handwriting here. The relay asks Claude to clean it up,
 | `POST /capture` | Yes | Handwriting in, task out |
 | `GET /meeting/upcoming` | Yes | Calendar events for the next day and a half |
 | `POST /meeting/end` | Yes | Pictures of the meeting's pages in; summary out, and the note-taker's own action items filed as tasks |
+| `POST /page/save` | Yes | One page picture in; Claude copies out the writing and the page is kept in the notes archive (only when the archive is on) |
+| `GET /page/hint` | Yes | Whether the tablet numbers the page on screen from 0 or from 1, once a save has shown which |
 | `POST /mcp` | Own token | Read-only connector so Claude can search and read the notes archive (only when the archive is on) |
 | `GET /oauth/start` | No (browser page) | One-time: connect Google Calendar by signing in |
 
@@ -22,9 +24,13 @@ The plugin sends the secret in the `x-relay-secret` header.
 
 The plugin sends up to 8 page pictures and, when it knows it, the meeting they belong to. If it does not, the relay uses the calendar meeting that is running or ended most recently. Claude copies out the handwriting, writes a short summary and separates the note-taker's action items from other people's. Only the note-taker's become tasks. A `requestId` makes a repeated request safe: the same id never files twice.
 
+### Save page
+
+The plugin's "Save page" button sends the picture of one notebook page with its notebook path and page number. Claude copies out everything on it and gives it a short title; the page is saved in the notes archive as a note of kind `page`. Nothing is filed anywhere else. Saving the same page again after adding to it replaces the earlier copy (same notebook, same page number, and most of the earlier writing still there); otherwise it is kept as a new note. If Claude cannot be reached the picture is saved anyway and the reply says so. A relay without `NOTES_DIR` answers 503.
+
 ### Notes archive and connector
 
-With `NOTES_DIR` set, every capture and every ended meeting is saved there (`records/*.json`, `pages/*.png`). With `NOTES_MCP_TOKEN` also set, `/mcp` serves a small read-only Model Context Protocol connector with four tools: `search_notes`, `list_recent_notes`, `read_note` and `get_note_page_image`. Add it in Claude as a custom connector with the header `Authorization: Bearer <token>`. It cannot file, change or delete anything.
+With `NOTES_DIR` set, every capture, every saved page and every ended meeting is saved there (`records/*.json`, `pages/*.png`). With `NOTES_MCP_TOKEN` also set, `/mcp` serves a small read-only Model Context Protocol connector with four tools: `search_notes`, `list_recent_notes`, `read_note` and `get_note_page_image`. Add it in Claude as a custom connector with the header `Authorization: Bearer <token>`. It cannot file, change or delete anything.
 
 ## Settings (environment variables)
 

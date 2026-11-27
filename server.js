@@ -40,6 +40,8 @@
  *                         connector as "Authorization: Bearer <token>".
  *       OWNER_NAME        optional  the note-taker's first name, so "my tasks"
  *                         can be told apart from other people's in a meeting
+ *   With the archive on, the plugin's "Save page" button (POST /page/save)
+ *   keeps a copy of one notebook page: the picture and the writing copied out.
  *
  *   SHOW_ALL_EVENTS    optional  set to 1 to list every timed calendar entry.
  *                                By default only entries with another attendee
@@ -56,7 +58,7 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-const VERSION = '0.5.1';
+const VERSION = '0.6.0';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // Meeting pages arrive as pictures, several at a time.
@@ -65,6 +67,7 @@ const MAX_END_PAGES = 8;
 const MAX_END_TASKS = 10;
 // The public address cuts a request off at 100 s, so Claude gets less than that.
 const MEETING_END_TIMEOUT_MS = 75000;
+const PAGE_READ_TIMEOUT_MS = 45000;
 const MEETING_RECENT_MS = 4 * 60 * 60 * 1000;
 const MAX_SUMMARY_LINES = 8;
 const MAX_SUMMARY_LINE_CHARS = 140;
@@ -991,7 +994,8 @@ let notesCache = null;
 
 function newNoteId(kind, at) {
   const stamp = at.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-  return `${stamp}-${kind === 'meeting' ? 'm' : 'c'}-${crypto.randomBytes(3).toString('hex')}`;
+  const letter = kind === 'meeting' ? 'm' : kind === 'page' ? 'p' : 'c';
+  return `${stamp}-${letter}-${crypto.randomBytes(3).toString('hex')}`;
 }
 
 function notebookName(notePath) {
@@ -1121,8 +1125,10 @@ function noteMatchesFilters(note, {kind, since, until}) {
   return true;
 }
 
+const KIND_LABEL = {meeting: 'Meeting', capture: 'Capture', page: 'Page'};
+
 function noteLine(note) {
-  const kind = note.kind === 'meeting' ? 'Meeting' : 'Capture';
+  const kind = KIND_LABEL[note.kind] || 'Capture';
   const where = note.notebook ? ` | notebook: ${note.notebook}` : '';
   const pages = (note.pages || []).length;
   return `${note.id} | ${note.day} | ${kind} | ${note.title}${where} | ${pages} page${pages === 1 ? '' : 's'}`;
@@ -1153,11 +1159,13 @@ function noteSnippet(note, terms) {
 
 function noteFullText(note) {
   const lines = [];
-  lines.push(`${note.kind === 'meeting' ? 'Meeting notes' : 'Capture'}: ${note.title}`);
+  lines.push(`${note.kind === 'meeting' ? 'Meeting notes' : note.kind === 'page' ? 'Saved page' : 'Capture'}: ${note.title}`);
   lines.push(`Id: ${note.id}`);
   lines.push(`Saved: ${note.day} (${note.at})`);
   if (note.notebook) {
-    lines.push(`Notebook: ${note.notebook}`);
+    const first = (note.pages || [])[0];
+    const where = note.kind === 'page' && first && Number.isInteger(first.page) ? `, page ${first.page + 1}` : '';
+    lines.push(`Notebook: ${note.notebook}${where}`);
   }
   if (note.meeting) {
     const m = note.meeting;
@@ -1668,6 +1676,217 @@ async function handleMeetingEnd(body) {
 }
 
 // ---------------------------------------------------------------------------
+// Save page
+//
+// The plugin's "Save page" button sends a picture of one notebook page. Claude
+// copies out what is on it and the page goes into the notes archive, where the
+// connector can find it. Nothing is filed anywhere else.
+// ---------------------------------------------------------------------------
+
+const savedPages = new Map();
+
+/**
+ * What the relay has learned about how the tablet numbers the page on screen:
+ * 0 or 1, or null while unknown. The tablet's own page counter may start at 1
+ * while pages in the file start at 0. The plugin shows the page before saving
+ * and reports what it learned (pageBase in the save request); the relay only
+ * keeps it, in the archive folder, so the plugin can ask after a restart.
+ */
+function pageHint() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(notesDir(), 'tablet.json'), 'utf8'));
+    return saved.pageBase === 0 || saved.pageBase === 1 ? saved.pageBase : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function rememberPageBase(base) {
+  if ((base !== 0 && base !== 1) || pageHint() === base) {
+    return;
+  }
+  try {
+    fs.mkdirSync(notesDir(), {recursive: true});
+    fs.writeFileSync(path.join(notesDir(), 'tablet.json'), JSON.stringify({pageBase: base, at: new Date().toISOString()}));
+  } catch (e) {
+    console.error('Save page: could not remember the page numbering:', e.message);
+  }
+}
+
+/** Asks Claude to copy out one page. Returns {title, text, about}. */
+async function readPage(imageBase64, notebook) {
+  const apiKey = env('ANTHROPIC_API_KEY');
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY is not set on the relay');
+  }
+  const system = [
+    'You copy out one page of a notebook so its owner can search for it later.',
+    'The page is mostly handwriting. It may also carry typed lines (a meeting title, attendees, a typed summary). Both count.',
+    'Use only what is on the page. Do not add, guess or tidy up facts, names or numbers.',
+    'Reply with a single JSON object and nothing else:',
+    '{"title": string, "text": string, "about": [string]}',
+    '- text: everything on the page in reading order, as plain text with its line breaks. Write [?] for a word you cannot read. For a drawing or diagram, add one line in square brackets saying what it shows.',
+    '- title: at most 60 characters saying what this page is about, as specifically as the page allows (the customer, person or topic). If the page starts with a title, use it.',
+    '- about: 1 to 3 short lines, at most 90 characters each, with the main facts on the page. An empty list if there is little on it.',
+    'If the page is blank, return an empty title, an empty text and an empty list.',
+  ].join('\n');
+  const res = await fetchWithTimeout(
+    `${env('ANTHROPIC_BASE_URL', 'https://api.anthropic.com')}/v1/messages`,
+    {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01'},
+      body: JSON.stringify({
+        model: env('CLAUDE_MODEL', 'claude-sonnet-5-5'),
+        max_tokens: 3000,
+        system,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {type: 'text', text: notebook ? `A page from the notebook "${notebook}".` : 'A notebook page.'},
+              {type: 'image', source: {type: 'base64', media_type: 'image/png', data: imageBase64}},
+            ],
+          },
+        ],
+      }),
+    },
+    PAGE_READ_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Claude API ${res.status}: ${body.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  const reply = (data.content || [])
+    .filter(part => part.type === 'text')
+    .map(part => part.text)
+    .join('');
+  const parsed = extractJson(reply);
+  return {
+    title: String(parsed.title || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+    text: String(parsed.text || '').trim(),
+    about: cleanLines(parsed.about, 3, MAX_SUMMARY_LINE_CHARS),
+  };
+}
+
+/** The words of a text that are worth comparing, lower-cased. */
+function pageWords(text) {
+  return new Set(
+    String(text || '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(word => word.length >= 4),
+  );
+}
+
+/**
+ * The note this page was saved as before, if any: same notebook, same page
+ * number, and most of the earlier writing still on the page. A page whose
+ * number now belongs to different writing (pages were added or removed in
+ * front of it) is not a match, so an older page is never overwritten by
+ * another one.
+ */
+function earlierSave(notePath, page, text) {
+  if (!notePath || !Number.isInteger(page)) {
+    return null;
+  }
+  const now = pageWords(text);
+  for (const note of loadNotes()) {
+    const first = (note.pages || [])[0];
+    if (note.kind !== 'page' || note.notePath !== notePath || !first || first.page !== page) {
+      continue;
+    }
+    const before = pageWords(first.text);
+    if (before.size < 4) {
+      continue;
+    }
+    let kept = 0;
+    for (const word of before) {
+      if (now.has(word)) {
+        kept += 1;
+      }
+    }
+    if (kept / before.size >= 0.6) {
+      return note;
+    }
+  }
+  return null;
+}
+
+async function handlePageSave(body) {
+  if (!notesDir()) {
+    throw Object.assign(new Error('This relay keeps no notes archive, so the page was not saved.'), {status: 503});
+  }
+  const requestId = typeof body.requestId === 'string' ? body.requestId.slice(0, 64) : '';
+  if (requestId && savedPages.has(requestId)) {
+    return {...savedPages.get(requestId), repeat: true};
+  }
+  const imageBase64 = typeof body.imageBase64 === 'string' ? body.imageBase64 : '';
+  if (!imageBase64) {
+    throw Object.assign(new Error('No page picture was sent'), {status: 400});
+  }
+  const notePath = typeof body.notePath === 'string' ? body.notePath.slice(0, 500) : '';
+  const page = Number.isInteger(body.page) && body.page >= 0 ? body.page : null;
+  const notebook = notebookName(notePath);
+  const fallbackTitle = `${notebook || 'Notebook'}${page != null ? ` page ${page + 1}` : ''}`;
+
+  let read = null;
+  let readError = '';
+  try {
+    read = await readPage(imageBase64, notebook);
+  } catch (e) {
+    // Keep the picture anyway: it can still be looked at, and saved again later.
+    readError = e.name === 'AbortError' ? 'Claude took too long' : e.message;
+    console.error('Save page: the page could not be read:', readError);
+  }
+  if (read && !read.text) {
+    throw Object.assign(new Error('This page looks empty, so nothing was saved.'), {status: 422});
+  }
+
+  const dryRun = env('DRY_RUN') === '1';
+  const earlier = read ? earlierSave(notePath, page, read.text) : null;
+  const title = (read && read.title) || fallbackTitle;
+  let noteId = null;
+  if (!dryRun) {
+    noteId = archiveNote(
+      {
+        id: earlier ? earlier.id : undefined,
+        kind: 'page',
+        title,
+        notePath,
+        summary: read ? read.about : [],
+      },
+      [{page, imageBase64, text: read ? read.text : ''}],
+    );
+    if (!noteId) {
+      throw Object.assign(new Error('The page could not be written to the archive.'), {status: 500});
+    }
+    rememberPageBase(body.pageBase);
+  }
+
+  const result = {
+    ok: true,
+    requestId,
+    title,
+    about: read ? read.about : [],
+    readOk: Boolean(read),
+    readError: read ? '' : 'The handwriting could not be read just now; the picture was saved. Save the page again later to make it searchable.',
+    replaced: Boolean(earlier),
+    archived: Boolean(noteId),
+    noteId,
+    pageBase: pageHint(),
+    dryRun,
+  };
+  if (requestId) {
+    savedPages.set(requestId, result);
+    if (savedPages.size > 30) {
+      savedPages.delete(savedPages.keys().next().value);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Notes connector (/mcp)
 //
 // A small, read-only Model Context Protocol server so Claude can search and
@@ -1684,12 +1903,12 @@ const MCP_TOOLS = [
     name: 'search_notes',
     title: 'Search Supernote notes',
     description:
-      "Search the owner's handwritten Supernote notes: meeting notes ended with the Meeting button (summary, action items, the handwriting copied out) and single captures sent to ClickUp. Every word of the query must appear somewhere in the note. Returns matching notes, newest first, with an id for read_note.",
+      "Search the owner's handwritten Supernote notes: meeting notes ended with the Meeting button (summary, action items, the handwriting copied out), single notebook pages saved with the Save page button, and single captures sent to ClickUp. Every word of the query must appear somewhere in the note. Returns matching notes, newest first, with an id for read_note.",
     inputSchema: {
       type: 'object',
       properties: {
         query: {type: 'string', description: 'Words to look for, e.g. a customer name, a person or a topic.'},
-        kind: {type: 'string', enum: ['meeting', 'capture'], description: 'Only this kind of note.'},
+        kind: {type: 'string', enum: ['meeting', 'page', 'capture'], description: 'Only this kind of note.'},
         since: {type: 'string', description: 'Only notes saved on or after this day, YYYY-MM-DD.'},
         until: {type: 'string', description: 'Only notes saved on or before this day, YYYY-MM-DD.'},
         limit: {type: 'integer', minimum: 1, maximum: 25, description: 'How many to return (default 10).'},
@@ -1706,7 +1925,7 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        kind: {type: 'string', enum: ['meeting', 'capture'], description: 'Only this kind of note.'},
+        kind: {type: 'string', enum: ['meeting', 'page', 'capture'], description: 'Only this kind of note.'},
         since: {type: 'string', description: 'Only notes saved on or after this day, YYYY-MM-DD.'},
         until: {type: 'string', description: 'Only notes saved on or before this day, YYYY-MM-DD.'},
         limit: {type: 'integer', minimum: 1, maximum: 25, description: 'How many to return (default 10).'},
@@ -1718,7 +1937,7 @@ const MCP_TOOLS = [
     name: 'read_note',
     title: 'Read one Supernote note',
     description:
-      'Read one note in full by id: the meeting it belongs to, the summary, the tasks filed in ClickUp, action items for other people, and the handwriting copied out page by page.',
+      'Read one note in full by id: the meeting it belongs to, the summary, the tasks filed in ClickUp, action items for other people, and the handwriting copied out page by page. For a saved page: the notebook and page number and everything written on it.',
     inputSchema: {
       type: 'object',
       properties: {id: {type: 'string', description: 'The note id from search_notes or list_recent_notes.'}},
@@ -1767,7 +1986,7 @@ function mcpText(text, isError = false) {
 
 function mcpFilters(args) {
   return {
-    kind: args.kind === 'meeting' || args.kind === 'capture' ? args.kind : '',
+    kind: args.kind === 'meeting' || args.kind === 'capture' || args.kind === 'page' ? args.kind : '',
     since: isDay(args.since) ? args.since : '',
     until: isDay(args.until) ? args.until : '',
     limit: Math.min(25, Math.max(1, Number.isInteger(args.limit) ? args.limit : 10)),
@@ -1865,7 +2084,7 @@ function mcpAnswer(message) {
         capabilities: {tools: {listChanged: false}},
         serverInfo: {name: 'supernote-notes', title: 'Supernote notes', version: VERSION},
         instructions:
-          "Read-only access to the owner's handwritten Supernote notes: meeting notes with summaries and action items, and single captures. Search with search_notes, then read_note for the full text.",
+          "Read-only access to the owner's handwritten Supernote notes: meeting notes with summaries and action items, single saved notebook pages, and single captures. Search with search_notes, then read_note for the full text.",
       });
     }
     case 'ping':
@@ -1986,6 +2205,7 @@ const server = http.createServer(async (req, res) => {
         briefs: briefsEnabled(),
         meetingEnd: true,
         notes: Boolean(notesDir()),
+        pageSave: Boolean(notesDir()),
         notesConnector: mcpEnabled(),
         googleClient: googleClientReady(),
         dryRun: env('DRY_RUN') === '1',
@@ -2001,6 +2221,16 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const result = await handleCapture(body);
       return sendJson(res, 200, result);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/page/hint') {
+      // What is known about the tablet's page numbering (see pageHint).
+      return sendJson(res, 200, {ok: true, pageSave: Boolean(notesDir()), pageBase: notesDir() ? pageHint() : null});
+    }
+
+    if (req.method === 'POST' && url.pathname === '/page/save') {
+      const body = await readJsonBody(req);
+      return sendJson(res, 200, await handlePageSave(body));
     }
 
     if (req.method === 'POST' && url.pathname === '/meeting/end') {
