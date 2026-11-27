@@ -54,8 +54,9 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // Meeting pages arrive as pictures, several at a time.
@@ -1222,6 +1223,146 @@ function cleanLines(value, maxLines, maxChars) {
     .map(line => line.slice(0, maxChars));
 }
 
+/**
+ * Looks at the picture of a page and reports where the writing stops, so the
+ * tablet can type the summary straight after the notes.
+ *
+ * Returns {width, height, inkBottom, rules}, all in the picture's own pixels:
+ *   inkBottom  the lowest row that has writing on it (typed or handwritten),
+ *              or 0 for an empty page
+ *   rules      the rows of the page's ruled lines, top to bottom
+ * A ruled line is a long unbroken dark run; anything dark and shorter is
+ * writing. Returns null for a picture it cannot read: the tablet then falls
+ * back to a new page.
+ */
+function pageInk(pngBase64) {
+  try {
+    const png = Buffer.from(pngBase64, 'base64');
+    if (png.length < 33 || png.readUInt32BE(0) !== 0x89504e47 || png.readUInt32BE(4) !== 0x0d0a1a0a) {
+      return null;
+    }
+    let width = 0;
+    let height = 0;
+    let colorType = -1;
+    const idat = [];
+    for (let pos = 8; pos + 12 <= png.length; ) {
+      const length = png.readUInt32BE(pos);
+      const type = png.toString('latin1', pos + 4, pos + 8);
+      const body = png.subarray(pos + 8, pos + 8 + length);
+      if (type === 'IHDR') {
+        width = body.readUInt32BE(0);
+        height = body.readUInt32BE(4);
+        colorType = body[9];
+        // 8 bits a channel, not interlaced, no palette: what the tablet makes.
+        if (body[8] !== 8 || body[12] !== 0 || ![0, 2, 4, 6].includes(colorType)) {
+          return null;
+        }
+      } else if (type === 'IDAT') {
+        idat.push(body);
+      } else if (type === 'IEND') {
+        break;
+      }
+      pos += 12 + length;
+    }
+    if (width < 50 || height < 50 || width > 4000 || height > 6000 || idat.length === 0) {
+      return null;
+    }
+    const channels = {0: 1, 2: 3, 4: 2, 6: 4}[colorType];
+    const stride = width * channels;
+    const raw = zlib.inflateSync(Buffer.concat(idat), {maxOutputLength: (stride + 1) * height + 1024});
+    if (raw.length < (stride + 1) * height) {
+      return null;
+    }
+    const ruleRun = Math.round(width * 0.4);
+    const inkRun = Math.round(width * 0.14);
+    const hasAlpha = colorType === 4 || colorType === 6;
+    const color = colorType === 2 || colorType === 6;
+    let prev = Buffer.alloc(stride);
+    let line = Buffer.alloc(stride);
+    const inkRows = new Uint8Array(height);
+    const ruleRows = [];
+    let lastRuleRow = -10;
+    for (let y = 0; y < height; y++) {
+      const start = y * (stride + 1);
+      const filter = raw[start];
+      raw.copy(line, 0, start + 1, start + 1 + stride);
+      if (filter === 1) {
+        for (let i = channels; i < stride; i++) {
+          line[i] = (line[i] + line[i - channels]) & 255;
+        }
+      } else if (filter === 2) {
+        for (let i = 0; i < stride; i++) {
+          line[i] = (line[i] + prev[i]) & 255;
+        }
+      } else if (filter === 3) {
+        for (let i = 0; i < stride; i++) {
+          const left = i >= channels ? line[i - channels] : 0;
+          line[i] = (line[i] + ((left + prev[i]) >> 1)) & 255;
+        }
+      } else if (filter === 4) {
+        for (let i = 0; i < stride; i++) {
+          const a = i >= channels ? line[i - channels] : 0;
+          const b = prev[i];
+          const c = i >= channels ? prev[i - channels] : 0;
+          const pa = Math.abs(b - c);
+          const pb = Math.abs(a - c);
+          const pc = Math.abs(a + b - 2 * c);
+          line[i] = (line[i] + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c)) & 255;
+        }
+      } else if (filter !== 0) {
+        return null;
+      }
+      let run = 0;
+      let longest = 0;
+      let ink = 0;
+      for (let x = 0; x <= width; x++) {
+        let dark = false;
+        if (x < width) {
+          const i = x * channels;
+          const lum = color ? (line[i] + line[i + 1] + line[i + 2]) / 3 : line[i];
+          dark = lum < 128 && (!hasAlpha || line[i + channels - 1] > 40);
+        }
+        if (dark) {
+          run += 1;
+        } else if (run > 0) {
+          if (run > longest) {
+            longest = run;
+          }
+          if (run < inkRun) {
+            ink += run;
+          }
+          run = 0;
+        }
+      }
+      if (longest >= ruleRun) {
+        // A thick rule covers a few rows; keep the first of each.
+        if (y - lastRuleRow > 2) {
+          ruleRows.push(y);
+        }
+        lastRuleRow = y;
+      }
+      if (ink >= 4) {
+        inkRows[y] = 1;
+      }
+      const swap = prev;
+      prev = line;
+      line = swap;
+    }
+    // Three ink rows in a row, so a stray speck does not count.
+    let inkBottom = 0;
+    for (let y = height - 1; y >= 2; y--) {
+      if (inkRows[y] && inkRows[y - 1] && inkRows[y - 2]) {
+        inkBottom = y;
+        break;
+      }
+    }
+    return {width, height, inkBottom, rules: ruleRows.slice(0, 80)};
+  } catch (e) {
+    console.error('Page picture could not be measured:', e.message);
+    return null;
+  }
+}
+
 /** The meeting the notes belong to, when the tablet did not say: now, or just ended. */
 async function recentMeeting() {
   const source = calendarSource();
@@ -1511,6 +1652,8 @@ async function handleMeetingEnd(body) {
     taskErrors: tasks.filter(t => t.error).length,
     others: read.others,
     pages: pages.length,
+    // Where the writing stops on the last page, for placing the summary.
+    lastPage: pageInk(pages[pages.length - 1].imageBase64),
     archived: Boolean(archivedId),
     noteId: archivedId,
     dryRun,
